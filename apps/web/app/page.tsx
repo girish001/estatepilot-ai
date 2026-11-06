@@ -11,13 +11,32 @@ export default function DashboardPage() {
   const [categoryFilter, setCategoryFilter] = useState<string>("ALL");
   const [languageFilter, setLanguageFilter] = useState<string>("ALL");
   const [statusFilter, setStatusFilter] = useState<string>("ALL");
+  const [csrfToken, setCsrfToken] = useState("");
   const [apiFeedback, setApiFeedback] = useState<{ type: "error" | "success"; message: string } | null>(null);
 
   useEffect(() => {
     let active = true;
+    fetch("/api/auth/me")
+      .then((res) => res.json().catch(() => null))
+      .then((authData) => {
+        if (active && authData?.csrfToken) {
+          setCsrfToken(authData.csrfToken);
+        }
+      })
+      .catch(() => {});
+
     fetch("/api/leads")
       .then(async (res) => {
         const data = await res.json().catch(() => null);
+        if (res.status === 401) {
+          if (active) {
+            setApiFeedback({
+              type: "error",
+              message: "Sign in at /login to view and manage live PostgreSQL leads. Displaying verified baseline preview."
+            });
+          }
+          return;
+        }
         if (!res.ok || !data?.success || !Array.isArray(data.leads)) {
           throw new Error(data?.message || `Failed to load leads (HTTP ${res.status})`);
         }
@@ -95,7 +114,10 @@ export default function DashboardPage() {
 
     fetch("/api/leads", {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-csrf-token": csrfToken
+      },
       body: JSON.stringify({ leadId: updated.id, status: newStatus })
     })
       .then(async (res) => {
@@ -127,7 +149,10 @@ export default function DashboardPage() {
 
     fetch("/api/leads", {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-csrf-token": csrfToken
+      },
       body: JSON.stringify({ leadId: updated.id, assignedExecutive: name })
     })
       .then(async (res) => {
@@ -519,7 +544,16 @@ export default function DashboardPage() {
                     </td>
                     <td>
                       <span style={{ fontSize: 12, color: "#475569" }}>
-                        {lead.nextActionAt ? new Date(lead.nextActionAt).toLocaleDateString("en-IN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "None"}
+                        {lead.nextActionAt
+                          ? new Date(lead.nextActionAt).toLocaleDateString("en-IN", {
+                              timeZone: "Asia/Kolkata",
+                              month: "short",
+                              day: "numeric",
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              hour12: true
+                            })
+                          : "None"}
                       </span>
                     </td>
                     <td>
@@ -556,7 +590,15 @@ export default function DashboardPage() {
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <span style={{ fontSize: 13, fontWeight: 800, color: "#2563eb" }}>{selectedLead.referenceNumber}</span>
                   {getStatusBadge(selectedLead.status)}
-                  <span style={{ fontSize: 12, color: "#64748b" }}>Captured: {new Date(selectedLead.createdAt).toLocaleDateString()}</span>
+                  <span style={{ fontSize: 12, color: "#64748b" }}>
+                    Captured:{" "}
+                    {new Date(selectedLead.createdAt).toLocaleDateString("en-IN", {
+                      timeZone: "Asia/Kolkata",
+                      day: "2-digit",
+                      month: "short",
+                      year: "numeric"
+                    })}
+                  </span>
                 </div>
                 <h2 style={{ fontSize: 24, fontWeight: 800, color: "#0f172a", margin: "6px 0 2px" }}>
                   {selectedLead.fullName}
@@ -601,7 +643,18 @@ export default function DashboardPage() {
                 <div style={{ fontSize: 12, lineHeight: 1.6, color: "#334155" }}>
                   <p><strong>Channel:</strong> {selectedLead.consent.channel}</p>
                   <p><strong>Status:</strong> {selectedLead.consent.granted ? "Explicitly Granted ✓" : "Revoked"}</p>
-                  <p><strong>Captured:</strong> {new Date(selectedLead.consent.capturedAt).toLocaleString()}</p>
+                  <p>
+                    <strong>Captured:</strong>{" "}
+                    {new Date(selectedLead.consent.capturedAt).toLocaleString("en-IN", {
+                      timeZone: "Asia/Kolkata",
+                      day: "2-digit",
+                      month: "short",
+                      year: "numeric",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                      hour12: true
+                    })}
+                  </p>
                   <p><strong>Evidence:</strong> {selectedLead.consent.evidence}</p>
                   <p style={{ marginTop: 8, color: "#b91c1c" }}>
                     {selectedLead.status === "DO_NOT_CONTACT" ? "⚠️ Customer opted out: System blocks all automated calling." : "Calling permitted within 09:00 - 19:00 IST."}

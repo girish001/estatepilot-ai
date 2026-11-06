@@ -156,11 +156,13 @@ export default function FollowUpsPage() {
                   <td><span style={{ color: "#2563eb", fontWeight: 700 }}>{v.propertyName}</span></td>
                   <td>
                     {new Date(v.scheduledAt).toLocaleString("en-IN", {
+                      timeZone: "Asia/Kolkata",
                       weekday: "short",
                       month: "short",
                       day: "numeric",
                       hour: "2-digit",
-                      minute: "2-digit"
+                      minute: "2-digit",
+                      hour12: true
                     })}
                   </td>
                   <td>

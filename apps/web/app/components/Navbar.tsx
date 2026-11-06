@@ -1,13 +1,43 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 interface NavbarProps {
   currentPath?: string;
 }
 
+interface AuthSessionUser {
+  id: string;
+  email: string;
+  fullName: string;
+  role: "SUPER_ADMIN" | "ADMIN" | "MANAGER" | "EXECUTIVE";
+}
+
 export default function Navbar({ currentPath = "/" }: NavbarProps) {
-  const [role, setRole] = useState<"ADMIN" | "MANAGER" | "SALES_EXECUTIVE">("ADMIN");
+  const [user, setUser] = useState<AuthSessionUser | null>(null);
+  const [requiresSetup, setRequiresSetup] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    fetch("/api/auth/me")
+      .then((res) => res.json().catch(() => null))
+      .then((data) => {
+        if (!active || !data) return;
+        if (data.authenticated && data.user) {
+          setUser(data.user);
+          setRequiresSetup(false);
+        } else {
+          setUser(null);
+          setRequiresSetup(Boolean(data.requiresInitialSetup));
+        }
+      })
+      .catch(() => {
+        // Keep unauthenticated state on network error
+      });
+    return () => {
+      active = false;
+    };
+  }, [currentPath]);
 
   const navLinks = [
     { href: "/", label: "Dashboard" },
@@ -48,27 +78,45 @@ export default function Navbar({ currentPath = "/" }: NavbarProps) {
           </nav>
 
           <div className="nav-actions">
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <span style={{ fontSize: 12, color: "#64748b", fontWeight: 600 }}>Role:</span>
-              <select
-                value={role}
-                onChange={(e) => setRole(e.target.value as "ADMIN" | "MANAGER" | "SALES_EXECUTIVE")}
+            {user ? (
+              <a
+                href="/login"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  fontSize: 12,
+                  fontWeight: 700,
+                  padding: "6px 10px",
+                  borderRadius: 6,
+                  border: "1px solid #bfdbfe",
+                  background: "#eff6ff",
+                  color: "#1e3a8a",
+                  textDecoration: "none"
+                }}
+              >
+                <span>🔒 {user.fullName.split(" ")[0]}</span>
+                <span style={{ fontSize: 11, background: "#dbeafe", padding: "1px 6px", borderRadius: 4 }}>
+                  {user.role}
+                </span>
+              </a>
+            ) : (
+              <a
+                href="/login"
                 style={{
                   fontSize: 12,
                   fontWeight: 700,
-                  padding: "4px 8px",
+                  padding: "6px 10px",
                   borderRadius: 6,
                   border: "1px solid #cbd5e1",
                   background: "#f8fafc",
                   color: "#0f172a",
-                  cursor: "pointer"
+                  textDecoration: "none"
                 }}
               >
-                <option value="ADMIN">Admin (All Access)</option>
-                <option value="MANAGER">Sales Manager</option>
-                <option value="SALES_EXECUTIVE">Sales Executive</option>
-              </select>
-            </div>
+                {requiresSetup ? "⚙️ Initial Admin Setup" : "🔑 Staff Sign In"}
+              </a>
+            )}
 
             <a href="/enquire" className="btn-primary" style={{ padding: "8px 14px", fontSize: 13 }}>
               <span>+ Enquiry Form</span>

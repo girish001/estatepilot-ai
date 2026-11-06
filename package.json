@@ -11,9 +11,19 @@
     "build": "npm run build --workspace=apps/web",
     "start": "npm run start --workspace=apps/web",
     "lint": "npm run lint --workspace=apps/web",
-    "typecheck": "npm run typecheck --workspace=apps/web"
+    "typecheck": "npm run typecheck --workspace=apps/web",
+    "test": "node --experimental-strip-types --import ./scripts/ts-loader.mjs scripts/run-tests.ts",
+    "db:migrate": "node --experimental-strip-types --import ./scripts/ts-loader.mjs scripts/migrate.ts",
+    "db:seed": "node --experimental-strip-types --import ./scripts/ts-loader.mjs scripts/seed-reviewed.ts",
+    "db:provision-admin": "node --experimental-strip-types --import ./scripts/ts-loader.mjs scripts/provision-first-admin.ts",
+    "admin:provision": "node --experimental-strip-types --import ./scripts/ts-loader.mjs scripts/provision-first-admin.ts"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.15",
+    "@types/pg": "^8.23.1",
+    "pg": "^8.23.1"
   }
 }

@@ -1,4 +1,4 @@
-import { INITIAL_PROPERTIES, SupportedLanguage, PropertyRecord } from "./store";
+import { INITIAL_PROPERTIES, type SupportedLanguage, type PropertyRecord } from "./store";
 
 export interface AIResponse {
   reply: string;
@@ -48,8 +48,12 @@ export function detectLanguage(text: string): SupportedLanguage {
 export function processCustomerTurn(
   customerMessage: string,
   currentLanguage: SupportedLanguage,
-  conversationHistory: Array<{ role: string; text: string }> = []
+  conversationHistory: Array<{ role: string; text: string }> = [],
+  inventorySource: PropertyRecord[] = INITIAL_PROPERTIES
 ): AIResponse {
+  const verifiedInventory = (inventorySource.length > 0 ? inventorySource : INITIAL_PROPERTIES).filter(
+    (p) => p.isVerified === true
+  );
   const explicitLang = detectExplicitLanguage(customerMessage);
   const lang: SupportedLanguage = explicitLang ?? currentLanguage;
   const lower = customerMessage.toLowerCase();
@@ -133,7 +137,7 @@ export function processCustomerTurn(
     return {
       reply: replies[lang],
       detectedLanguage: lang,
-      matchedProperties: INITIAL_PROPERTIES.slice(0, 2),
+      matchedProperties: verifiedInventory.slice(0, 2),
       escalateToHuman: false,
       optOutRequested: false,
       siteVisitRequested: true,
@@ -143,17 +147,17 @@ export function processCustomerTurn(
 
   // 4. Property Category Matching & Verified Inventory Inquiries
   if (lower.includes("plot") || lower.includes("land") || lower.includes("site") || lower.includes("ಜಾಗ") || lower.includes("ಪ್ಲಾಟ್") || lower.includes("ప్లాట్") || lower.includes("प्लॉट")) {
-    const prop = INITIAL_PROPERTIES.find((p) => p.category === "PLOT");
+    const prop = verifiedInventory.find((p) => p.category === "PLOT");
     const replies: Record<SupportedLanguage, string> = {
-      English: `For residential plots, we have verified inventory at Greenfield Serene County near Devanahalli Airport corridor. Approved plot sizes range from 1,200 to 2,400 sq.ft. The approved rate is ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")} per sq.ft. It has BIAAPA and RERA approval with underground cabling and clubhouse amenities. Would you like to schedule a site visit?`,
-      Kannada: `ಪ್ಲಾಟ್‌ಗಳಿಗಾಗಿ ನಮ್ಮಲ್ಲಿ ದೇವನಹಳ್ಳಿ ಎಂ.ಎಚ್-44 ರಸ್ತೆಯಲ್ಲಿರುವ Greenfield Serene County ನ ಅನುಮೋದಿತ ಜಾಗಗಳಿವೆ. 1,200 ರಿಂದ 2,400 ಚದರ ಅಡಿ ಪ್ಲಾಟ್‌ಗಳಿವೆ. ಆಡಳಿತ ಮಂಡಳಿಯಿಂದ ಅನುಮೋದಿತ ದರ ಪ್ರತಿ ಚದರ ಅಡಿಗೆ ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")}. BIAAPA ಮತ್ತು RERA ಅನುಮೋದನೆ ಪಡೆದಿದೆ. ನೀವು ಸೈಟ್ ನೋಡಲು ಇಷ್ಟಪಡುತ್ತೀರಾ?`,
-      Telugu: `రెసిడెన్షియల్ ప్లాట్ల కోసం దేవనహల్లి ఎయిర్‌పోర్ట్ కారిడార్‌లో Greenfield Serene County అందుబాటులో ఉంది. ప్లాట్ సైజులు 1,200 నుండి 2,400 చదరపు అడుగులు. ఆమోదించబడిన బేస్ రేటు చదరపు అడుగుకి ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")}. BIAAPA & RERA సర్టిఫికేషన్లు ఉన్నాయి. మీరు సైట్ విజిట్ చూడాలనుకుంటున్నారా?`,
-      Hindi: `आवासीय प्लॉट्स के लिए हमारे पास देवनहल्ली एयरपोर्ट कॉरिडोर के पास Greenfield Serene County उपलब्ध है। प्लॉट का आकार 1,200 से 2,400 वर्ग फुट है। स्वीकृत दर ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")} प्रति वर्ग फुट है। यह BIAAPA और RERA द्वारा स्वीकृत है। क्या आप साइट विजिट करना चाहेंगे?`
+      English: `For residential plots, we have verified inventory at Greenfield Serene County near Devanahalli Airport corridor. Approved plot sizes range from 1,200 to 2,400 sq.ft. The approved rate is ₹${(prop?.approvedRatePerSqFt ?? 3850).toLocaleString("en-IN")} per sq.ft. It has BIAAPA and RERA approval with underground cabling and clubhouse amenities. Would you like to schedule a site visit?`,
+      Kannada: `ಪ್ಲಾಟ್‌ಗಳಿಗಾಗಿ ನಮ್ಮಲ್ಲಿ ದೇವನಹಳ್ಳಿ ಎಂ.ಎಚ್-44 ರಸ್ತೆಯಲ್ಲಿರುವ Greenfield Serene County ನ ಅನುಮೋದಿತ ಜಾಗಗಳಿವೆ. 1,200 ರಿಂದ 2,400 ಚದರ ಅಡಿ ಪ್ಲಾಟ್‌ಗಳಿವೆ. ಆಡಳಿತ ಮಂಡಳಿಯಿಂದ ಅನುಮೋದಿತ ದರ ಪ್ರತಿ ಚದರ ಅಡಿಗೆ ₹${(prop?.approvedRatePerSqFt ?? 3850).toLocaleString("en-IN")}. BIAAPA ಮತ್ತು RERA ಅನುಮೋದನೆ ಪಡೆದಿದೆ. ನೀವು ಸೈಟ್ ನೋಡಲು ಇಷ್ಟಪಡುತ್ತೀರಾ?`,
+      Telugu: `రెసిడెన్షియల్ ప్లాట్ల కోసం దేవనహల్లి ఎయిర్‌పోర్ట్ కారిడార్‌లో Greenfield Serene County అందుబాటులో ఉంది. ప్లాట్ సైజులు 1,200 నుండి 2,400 చదరపు అడుగులు. ఆమోదించబడిన బేస్ రేటు చదరపు అడుగుకి ₹${(prop?.approvedRatePerSqFt ?? 3850).toLocaleString("en-IN")}. BIAAPA & RERA సర్టిఫికేషన్లు ఉన్నాయి. మీరు సైట్ విజిట్ చూడాలనుకుంటున్నారా?`,
+      Hindi: `आवासीय प्लॉट्स के लिए हमारे पास देवनहल्ली एयरपोर्ट कॉरिडोर के पास Greenfield Serene County उपलब्ध है। प्लॉट का आकार 1,200 से 2,400 वर्ग फुट है। स्वीकृत दर ₹${(prop?.approvedRatePerSqFt ?? 3850).toLocaleString("en-IN")} प्रति वर्ग फुट है। यह BIAAPA और RERA द्वारा स्वीकृत है। क्या आप साइट विजिट करना चाहेंगे?`
     };
     return {
       reply: replies[lang],
       detectedLanguage: lang,
-      matchedProperties: INITIAL_PROPERTIES.filter((p) => p.category === "PLOT"),
+      matchedProperties: verifiedInventory.filter((p) => p.category === "PLOT"),
       escalateToHuman: false,
       optOutRequested: false,
       siteVisitRequested: false,
@@ -162,17 +166,17 @@ export function processCustomerTurn(
   }
 
   if (lower.includes("flat") || lower.includes("apartment") || lower.includes("2 bhk") || lower.includes("3 bhk") || lower.includes("ఫ్లాట్") || lower.includes("ಅಪಾರ್ಟ್ಮೆಂಟ್") || lower.includes("फ्लैट")) {
-    const prop = INITIAL_PROPERTIES.find((p) => p.category === "FLAT");
+    const prop = verifiedInventory.find((p) => p.category === "FLAT");
     const replies: Record<SupportedLanguage, string> = {
-      English: `For apartments, we have Prestige Elm Greens on Varthur-Whitefield Main Road offering 2 & 3 BHK homes from 1,180 to 1,750 sq.ft. The approved rate is ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")} per sq.ft. Possession is March 2027 with Olympic-length swimming pool and sports courts. Would you like more details?`,
-      Kannada: `ಅಪಾರ್ಟ್‌ಮೆಂಟ್‌ಗಳಿಗಾಗಿ ವೈಟ್‌ಫೀಲ್ಡ್-ವರ್ತೂರು ಮುಖ್ಯ ರಸ್ತೆಯಲ್ಲಿ Prestige Elm Greens ನಲ್ಲಿ 2 ಮತ್ತು 3 ಬಿ.ಎಚ್.ಕೆ ಮನೆಗಳಿವೆ (1,180 ರಿಂದ 1,750 ಚ.ಅಡಿ). ಅನುಮೋದಿತ ದರ ಪ್ರತಿ ಚ.ಅಡಿಗೆ ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")}. ಸ್ವಾಧೀನ ಮಾರ್ಚ್ 2027. ನೀವು ಈ ಯೋಜನೆಯ ವಿವರಗಳನ್ನು ಬಯಸುವಿರಾ?`,
-      Telugu: `అపార్ట్‌మెంట్ల కోసం వైట్‌ఫీల్డ్-వర్తూర్ మెయిన్ రోడ్డులో Prestige Elm Greens ప్రాజెక్ట్‌లో 2 & 3 BHK ఫ్లాట్లు ఉన్నాయి (1,180 నుండి 1,750 చ.అడుగులు). ఆమోదించిన రేటు చదరపు అడుగుకి ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")}. మార్చి 2027 లో పొజిషన్ ఉంటుంది. మీకు మరిన్ని వివరాలు కావాలా?`,
-      Hindi: `अपार्टमेंट्स के लिए हमारे पास व्हाइटफील्ड-वर्थूर मेन रोड पर Prestige Elm Greens में 2 और 3 बीएचके फ्लैट्स उपलब्ध हैं (1,180 से 1,750 वर्ग फुट)। स्वीकृत दर ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")} प्रति वर्ग फुट है। पजेशन मार्च 2027 में है। क्या आप इसकी अधिक जानकारी चाहेंगे?`
+      English: `For apartments, we have Prestige Elm Greens on Varthur-Whitefield Main Road offering 2 & 3 BHK homes from 1,180 to 1,750 sq.ft. The approved rate is ₹${(prop?.approvedRatePerSqFt ?? 7400).toLocaleString("en-IN")} per sq.ft. Possession is March 2027 with Olympic-length swimming pool and sports courts. Would you like more details?`,
+      Kannada: `ಅಪಾರ್ಟ್‌ಮೆಂಟ್‌ಗಳಿಗಾಗಿ ವೈಟ್‌ಫೀಲ್ಡ್-ವರ್ತೂರು ಮುಖ್ಯ ರಸ್ತೆಯಲ್ಲಿ Prestige Elm Greens ನಲ್ಲಿ 2 ಮತ್ತು 3 ಬಿ.ಎಚ್.ಕೆ ಮನೆಗಳಿವೆ (1,180 ರಿಂದ 1,750 ಚ.ಅಡಿ). ಅನುಮೋದಿತ ದರ ಪ್ರತಿ ಚ.ಅಡಿಗೆ ₹${(prop?.approvedRatePerSqFt ?? 7400).toLocaleString("en-IN")}. ಸ್ವಾಧೀನ ಮಾರ್ಚ್ 2027. ನೀವು ಈ ಯೋಜನೆಯ ವಿವರಗಳನ್ನು ಬಯಸುವಿರಾ?`,
+      Telugu: `అపార్ట్‌మెంట్ల కోసం వైట్‌ఫీల్డ్-వర్తూర్ మెయిన్ రోడ్డులో Prestige Elm Greens ప్రాజెక్ట్‌లో 2 & 3 BHK ఫ్లాట్లు ఉన్నాయి (1,180 నుండి 1,750 చ.అడుగులు). ఆమోదించిన రేటు చదరపు అడుగుకి ₹${(prop?.approvedRatePerSqFt ?? 7400).toLocaleString("en-IN")}. మార్చి 2027 లో పొజిషన్ ఉంటుంది. మీకు మరిన్ని వివరాలు కావాలా?`,
+      Hindi: `अपार्टमेंट्स के लिए हमारे पास व्हाइटफील्ड-वर्थूर मेन रोड पर Prestige Elm Greens में 2 और 3 बीएचके फ्लैट्स उपलब्ध हैं (1,180 से 1,750 वर्ग फुट)। स्वीकृत दर ₹${(prop?.approvedRatePerSqFt ?? 7400).toLocaleString("en-IN")} प्रति वर्ग फुट है। पजेशन मार्च 2027 में है। क्या आप इसकी अधिक जानकारी चाहेंगे?`
     };
     return {
       reply: replies[lang],
       detectedLanguage: lang,
-      matchedProperties: INITIAL_PROPERTIES.filter((p) => p.category === "FLAT"),
+      matchedProperties: verifiedInventory.filter((p) => p.category === "FLAT"),
       escalateToHuman: false,
       optOutRequested: false,
       siteVisitRequested: false,
@@ -181,17 +185,17 @@ export function processCustomerTurn(
   }
 
   if (lower.includes("villa") || lower.includes("ವಿಲ್ಲಾ") || lower.includes("విల్లా") || lower.includes("विला")) {
-    const prop = INITIAL_PROPERTIES.find((p) => p.category === "VILLA");
+    const prop = verifiedInventory.find((p) => p.category === "VILLA");
     const replies: Record<SupportedLanguage, string> = {
-      English: `For luxury villas, we feature Palm Valley Signature Villas on Sarjapur-Attibele Road. These are 4 BHK triplex villas from 3,400 to 4,200 sq.ft. with private plunge pools. The approved rate is ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")} per sq.ft. Possession is scheduled for October 2026. Shall we coordinate a model villa walkthrough?`,
-      Kannada: `ಐಷಾರಾಮಿ ವಿಲ್ಲಾಗಳಿಗಾಗಿ ಸರ್ಜಾಪುರ-ಅತ್ತಿಬೆಲೆ ರಸ್ತೆಯಲ್ಲಿ Palm Valley Signature Villas ಲಭ್ಯವಿದೆ. 3,400 ರಿಂದ 4,200 ಚ.ಅಡಿಯ 4 ಬಿ.ಎಚ್.ಕೆ ಟ್ರಿಪ್ಲೆಕ್ಸ್ ವಿಲ್ಲಾಗಳಾಗಿದ್ದು, ಖಾಸಗಿ ಪೂಲ್ ಹೊಂದಿದೆ. ಅನುಮೋದಿತ ದರ ಚ.ಅಡಿಗೆ ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")}. ಅಕ್ಟೋಬರ್ 2026 ರಲ್ಲಿ ಸ್ವಾಧೀನ. ಮಾದರಿ ವಿಲ್ಲಾ ನೋಡಲು ಸಮಯ ನಿಗದಿಪಡಿಸೋಣವೇ?`,
-      Telugu: `లగ్జరీ విల్లాల కోసం సర్జాపూర్-అత్తిబెలె రోడ్డులో Palm Valley Signature Villas ప్రాజెక్ట్ ఉంది. ఇవి ప్రైవేట్ పూల్ ఉన్న 4 BHK ట్రిప్లెక్స్ విల్లాలు (3,400 నుండి 4,200 చ.అడుగులు). ఆమోదించిన రేటు చ.అడుగుకి ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")}. అక్టోబర్ 2026 నాటికి పొజిషన్. శాంపిల్ విల్లా చూడటానికి ప్లాన్ చేద్దామా?`,
-      Hindi: `लक्ज़री विला के लिए हमारे पास सरजापुर-अत्तीबेले रोड पर Palm Valley Signature Villas हैं। ये 3,400 से 4,200 वर्ग फुट के 4 बीएचके ट्रिप्लेक्स विला हैं जिनमें प्राइवेट पूल की सुविधा है। स्वीकृत दर ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")} प्रति वर्ग फुट है। पजेशन अक्टूबर 2026 में है। क्या आप मॉडल विला देखना चाहेंगे?`
+      English: `For luxury villas, we feature Palm Valley Signature Villas on Sarjapur-Attibele Road. These are 4 BHK triplex villas from 3,400 to 4,200 sq.ft. with private plunge pools. The approved rate is ₹${(prop?.approvedRatePerSqFt ?? 9600).toLocaleString("en-IN")} per sq.ft. Possession is scheduled for October 2026. Shall we coordinate a model villa walkthrough?`,
+      Kannada: `ಐಷಾರಾಮಿ ವಿಲ್ಲಾಗಳಿಗಾಗಿ ಸರ್ಜಾಪುರ-ಅತ್ತಿಬೆಲೆ ರಸ್ತೆಯಲ್ಲಿ Palm Valley Signature Villas ಲಭ್ಯವಿದೆ. 3,400 ರಿಂದ 4,200 ಚ.ಅಡಿಯ 4 ಬಿ.ಎಚ್.ಕೆ ಟ್ರಿಪ್ಲೆಕ್ಸ್ ವಿಲ್ಲಾಗಳಾಗಿದ್ದು, ಖಾಸಗಿ ಪೂಲ್ ಹೊಂದಿದೆ. ಅನುಮೋದಿತ ದರ ಚ.ಅಡಿಗೆ ₹${(prop?.approvedRatePerSqFt ?? 9600).toLocaleString("en-IN")}. ಅಕ್ಟೋಬರ್ 2026 ರಲ್ಲಿ ಸ್ವಾಧೀನ. ಮಾದರಿ ವಿಲ್ಲಾ ನೋಡಲು ಸಮಯ ನಿಗದಿಪಡಿಸೋಣವೇ?`,
+      Telugu: `లగ్జరీ విల్లాల కోసం సర్జాపూర్-అత్తిబెలె రోడ్డులో Palm Valley Signature Villas ప్రాజెక్ట్ ఉంది. ఇవి ప్రైవేట్ పూల్ ఉన్న 4 BHK ట్రిప్లెక్స్ విల్లాలు (3,400 నుండి 4,200 చ.అడుగులు). ఆమోదించిన రేటు చ.అడుగుకి ₹${(prop?.approvedRatePerSqFt ?? 9600).toLocaleString("en-IN")}. అక్టోబర్ 2026 నాటికి పొజిషన్. శాంపిల్ విల్లా చూడటానికి ప్లాన్ చేద్దామా?`,
+      Hindi: `लक्ज़री विला के लिए हमारे पास सरजापुर-अत्तीबेले रोड पर Palm Valley Signature Villas हैं। ये 3,400 से 4,200 वर्ग फुट के 4 बीएचके ट्रिप्लेक्स विला हैं जिनमें प्राइवेट पूल की सुविधा है। स्वीकृत दर ₹${(prop?.approvedRatePerSqFt ?? 9600).toLocaleString("en-IN")} प्रति वर्ग फुट है। पजेशन अक्टूबर 2026 में है। क्या आप मॉडल विला देखना चाहेंगे?`
     };
     return {
       reply: replies[lang],
       detectedLanguage: lang,
-      matchedProperties: INITIAL_PROPERTIES.filter((p) => p.category === "VILLA"),
+      matchedProperties: verifiedInventory.filter((p) => p.category === "VILLA"),
       escalateToHuman: false,
       optOutRequested: false,
       siteVisitRequested: false,
@@ -200,17 +204,17 @@ export function processCustomerTurn(
   }
 
   if (lower.includes("house") || lower.includes("independent") || lower.includes("ಮನೆ") || lower.includes("ఇల్లు") || lower.includes("घर")) {
-    const prop = INITIAL_PROPERTIES.find((p) => p.category === "INDEPENDENT_HOUSE");
+    const prop = verifiedInventory.find((p) => p.category === "INDEPENDENT_HOUSE");
     const replies: Record<SupportedLanguage, string> = {
-      English: `For independent houses, we offer Sobha Meadows in Rajankunte, Yelahanka Extension. These are individual residences with private gardens and dual car parking. The approved rate is ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")} per sq.ft. Ready possession by September 2026. Would you like a site visit?`,
-      Kannada: `ಸ್ವತಂತ್ರ ಮನೆಗಳಿಗಾಗಿ (Independent Houses) ಯಲಹಂಕ ಸಮೀಪದ ರಾಜನಕುಂಟೆಯಲ್ಲಿ Sobha Meadows ಲಭ್ಯವಿದೆ. ಖಾಸಗಿ ಗಾರ್ಡನ್ ಮತ್ತು ಪಾರ್ಕಿಂಗ್ ಸೌಲಭ್ಯವಿದೆ. ಅನುಮೋದಿತ ದರ ಪ್ರತಿ ಚ.ಅಡಿಗೆ ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")}. ಸೆಪ್ಟೆಂಬರ್ 2026 ರೊಳಗೆ ಸಿದ್ಧವಾಗಲಿದೆ. ಸೈಟ್ ನೋಡಲು ಬಯಸುವಿರಾ?`,
-      Telugu: `ఇండిపెండెంట్ హౌస్‌ల కోసం యలహంక ఎక్స్‌టెన్షన్ రాజనకుంటె వద్ద Sobha Meadows అందుబాటులో ఉంది. ప్రైవేట్ గార్డెన్ మరియు పార్కింగ్ కలవు. ఆమోదించబడిన బేస్ రేటు చదరపు అడుగుకి ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")}. సెప్టెంబర్ 2026 నాటికి రెడీ. సైట్ విజిట్ చేయాలనుకుంటున్నారా?`,
-      Hindi: `इंडिपेंडेंट मकानों के लिए हमारे पास यलहंका के पास राजनकुंटे में Sobha Meadows उपलब्ध है। इसमें प्राइवेट गार्डन और पार्किंग की सुविधा है। स्वीकृत दर ₹${prop?.approvedRatePerSqFt.toLocaleString("en-IN")} प्रति वर्ग फुट है। सितंबर 2026 तक पजेशन तैयार है। क्या आप साइट विजिट करना चाहेंगे?`
+      English: `For independent houses, we offer Sobha Meadows in Rajankunte, Yelahanka Extension. These are individual residences with private gardens and dual car parking. The approved rate is ₹${(prop?.approvedRatePerSqFt ?? 6250).toLocaleString("en-IN")} per sq.ft. Ready possession by September 2026. Would you like a site visit?`,
+      Kannada: `ಸ್ವತಂತ್ರ ಮನೆಗಳಿಗಾಗಿ (Independent Houses) ಯಲಹಂಕ ಸಮೀಪದ ರಾಜನಕುಂಟೆಯಲ್ಲಿ Sobha Meadows ಲಭ್ಯವಿದೆ. ಖಾಸಗಿ ಗಾರ್ಡನ್ ಮತ್ತು ಪಾರ್ಕಿಂಗ್ ಸೌಲಭ್ಯವಿದೆ. ಅನುಮೋದಿತ ದರ ಪ್ರತಿ ಚ.ಅಡಿಗೆ ₹${(prop?.approvedRatePerSqFt ?? 6250).toLocaleString("en-IN")}. ಸೆಪ್ಟೆಂಬರ್ 2026 ರೊಳಗೆ ಸಿದ್ಧವಾಗಲಿದೆ. ಸೈಟ್ ನೋಡಲು ಬಯಸುವಿರಾ?`,
+      Telugu: `ఇండిపెండెంట్ హౌస్‌ల కోసం యలహంక ఎక్స్‌టెన్షన్ రాజనకుంటె వద్ద Sobha Meadows అందుబాటులో ఉంది. ప్రైవేట్ గార్డెన్ మరియు పార్కింగ్ కలవు. ఆమోదించబడిన బేస్ రేటు చదరపు అడుగుకి ₹${(prop?.approvedRatePerSqFt ?? 6250).toLocaleString("en-IN")}. సెప్టెంబర్ 2026 నాటికి రెడీ. సైట్ విజిట్ చేయాలనుకుంటున్నారా?`,
+      Hindi: `इंडिपेंडेंट मकानों के लिए हमारे पास यलहंका के पास राजनकुंटे में Sobha Meadows उपलब्ध है। इसमें प्राइवेट गार्डन और पार्किंग की सुविधा है। स्वीकृत दर ₹${(prop?.approvedRatePerSqFt ?? 6250).toLocaleString("en-IN")} प्रति वर्ग फुट है। सितंबर 2026 तक पजेशन तैयार है। क्या आप साइट विजिट करना चाहेंगे?`
     };
     return {
       reply: replies[lang],
       detectedLanguage: lang,
-      matchedProperties: INITIAL_PROPERTIES.filter((p) => p.category === "INDEPENDENT_HOUSE"),
+      matchedProperties: verifiedInventory.filter((p) => p.category === "INDEPENDENT_HOUSE"),
       escalateToHuman: false,
       optOutRequested: false,
       siteVisitRequested: false,
@@ -229,7 +233,7 @@ export function processCustomerTurn(
   return {
     reply: defaultReplies[lang],
     detectedLanguage: lang,
-    matchedProperties: INITIAL_PROPERTIES,
+    matchedProperties: verifiedInventory,
     escalateToHuman: false,
     optOutRequested: false,
     siteVisitRequested: false

@@ -1,196 +1,184 @@
 import { NextResponse } from "next/server";
-import { INITIAL_LEADS, LeadRecord, LeadStatus, matchProperties, PropertyCategory, SupportedLanguage } from "../../lib/store";
-import { randomUUID } from "node:crypto";
+import {
+  checkPublicEnquiryRateLimit,
+  getClientIp,
+  requireRole
+} from "../../lib/auth";
+import { redactPII } from "../../lib/db";
+import {
+  createLeadInDb,
+  listLeadsFromDb,
+  updateLeadInDb
+} from "../../lib/repositories";
+import type { LeadStatus } from "../../lib/store";
 
 export const dynamic = "force-dynamic";
 
-// In-memory runtime leads state
-let leadsState: LeadRecord[] = [...INITIAL_LEADS];
-
 export async function GET(request: Request) {
-  const { searchParams } = new URL(request.url);
-  const status = searchParams.get("status");
-  const category = searchParams.get("category");
-  const language = searchParams.get("language");
-  const query = searchParams.get("q")?.toLowerCase();
+  const auth = await requireRole(request, ["SUPER_ADMIN", "ADMIN", "MANAGER", "EXECUTIVE"]);
+  if (!auth.authorized) return auth.response;
 
-  let filtered = [...leadsState];
+  try {
+    const { searchParams } = new URL(request.url);
+    const status = searchParams.get("status");
+    const category = searchParams.get("category");
+    const language = searchParams.get("language");
+    const q = searchParams.get("q");
+    const page = Number(searchParams.get("page") || 1);
+    const pageSize = Number(searchParams.get("pageSize") || 50);
 
-  if (status && status !== "ALL") {
-    filtered = filtered.filter((l) => l.status === status);
-  }
-  if (category && category !== "ALL") {
-    filtered = filtered.filter((l) => l.propertyType === category);
-  }
-  if (language && language !== "ALL") {
-    filtered = filtered.filter((l) => l.preferredLanguage.toLowerCase() === language.toLowerCase());
-  }
-  if (query) {
-    filtered = filtered.filter(
-      (l) =>
-        l.fullName.toLowerCase().includes(query) ||
-        l.phone.includes(query) ||
-        l.preferredLocation.toLowerCase().includes(query) ||
-        l.referenceNumber.toLowerCase().includes(query)
+    const result = await listLeadsFromDb({
+      status,
+      category,
+      language,
+      q,
+      page,
+      pageSize,
+      actor: auth.session.user
+    });
+
+    return NextResponse.json({
+      success: true,
+      ...result
+    });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : "Failed to load leads.";
+    console.error("[GET /api/leads Error]:", redactPII(msg));
+    return NextResponse.json(
+      { success: false, message: "Unable to query leads from database." },
+      { status: 500 }
     );
   }
-
-  // Calculate analytics metrics
-  const total = leadsState.length;
-  const newLeads = leadsState.filter((l) => l.status === "NEW").length;
-  const contacted = leadsState.filter((l) => l.status === "CONTACTED").length;
-  const interested = leadsState.filter((l) => l.status === "INTERESTED").length;
-  const callbacksDue = leadsState.filter((l) => l.status === "CALLBACK_SCHEDULED").length;
-  const siteVisitsScheduled = leadsState.filter((l) => l.status === "SITE_VISIT_SCHEDULED").length;
-  const siteVisitsCompleted = leadsState.filter((l) => l.status === "SITE_VISITED").length;
-  const converted = leadsState.filter((l) => l.status === "CONVERTED").length;
-  const lost = leadsState.filter((l) => l.status === "LOST" || l.status === "DO_NOT_CONTACT").length;
-
-  return NextResponse.json({
-    success: true,
-    leads: filtered,
-    metrics: {
-      total,
-      newLeads,
-      contacted,
-      interested,
-      callbacksDue,
-      siteVisitsScheduled,
-      siteVisitsCompleted,
-      converted,
-      lost
-    }
-  });
 }
 
 export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-    const {
-      fullName,
-      phone,
-      email,
-      propertyType,
-      preferredLocation,
-      preferredArea,
-      preferredLanguage,
-      callConsent,
-      source
-    } = body;
-
-    // Strict validation
-    if (!fullName || typeof fullName !== "string" || fullName.trim().length === 0) {
-      return NextResponse.json({ success: false, message: "Full name is required." }, { status: 400 });
-    }
-
-    const cleanPhone = String(phone || "").replace(/\D/g, "");
-    const last10Digits = cleanPhone.slice(-10);
-    if (last10Digits.length !== 10) {
-      return NextResponse.json(
-        { success: false, message: "Please provide a valid 10-digit Indian mobile number." },
-        { status: 400 }
-      );
-    }
-
-    if (!callConsent) {
-      return NextResponse.json(
-        { success: false, message: "Consent to be contacted is required to submit an enquiry." },
-        { status: 400 }
-      );
-    }
-
-    const category: PropertyCategory = ["PLOT", "INDEPENDENT_HOUSE", "FLAT", "VILLA"].includes(propertyType)
-      ? propertyType
-      : "PLOT";
-
-    const lang: SupportedLanguage = ["English", "Kannada", "Telugu", "Hindi"].includes(preferredLanguage)
-      ? preferredLanguage
-      : "English";
-
-    // Strictly ensure no budget fields were accepted
-    const matched = matchProperties(category, preferredLocation);
-    const referenceNumber = `EP-2026-${Math.floor(1000 + Math.random() * 9000)}`;
-    const newLeadId = `lead-${Date.now()}`;
-    const roomId = `room-${randomUUID().slice(0, 8)}`;
-
-    const newLead: LeadRecord = {
-      id: newLeadId,
-      referenceNumber,
-      fullName: fullName.trim(),
-      phone: `+91${last10Digits}`,
-      email: email ? String(email).trim() : undefined,
-      source: source || "PUBLIC_WEBSITE",
-      propertyType: category,
-      preferredLocation: preferredLocation ? String(preferredLocation).trim() : "Bangalore",
-      preferredArea: preferredArea ? String(preferredArea).trim() : "Standard",
-      preferredLanguage: lang,
-      status: "NEW",
-      consent: {
-        channel: "PHONE_CALL",
-        granted: true,
-        capturedAt: new Date().toISOString(),
-        purpose: "Property consultation & site-visit scheduling",
-        evidence: "Online enquiry submission checkbox verified: Customer agreed to phone contact."
+  const ip = getClientIp(request);
+  const rateLimit = checkPublicEnquiryRateLimit(ip);
+  if (!rateLimit.allowed) {
+    return NextResponse.json(
+      {
+        success: false,
+        code: "RATE_LIMITED",
+        message: `Too many enquiry submissions from this address. Please wait ${rateLimit.retryAfterSeconds} seconds.`
       },
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      assignedExecutive: "Rajesh Sharma (Senior Property Specialist)",
-      notes: "Newly received website enquiry. Budget was NOT requested per EstatePilot core rules.",
-      matchedPropertyIds: matched.map((p) => p.id),
-      callIds: [],
-      siteVisitIds: []
-    };
+      {
+        status: 429,
+        headers: { "Retry-After": String(rateLimit.retryAfterSeconds) }
+      }
+    );
+  }
 
-    leadsState.unshift(newLead);
+  const contentLength = Number(request.headers.get("content-length") || 0);
+  if (contentLength > 16_384) {
+    return NextResponse.json(
+      { success: false, message: "Request payload too large." },
+      { status: 413 }
+    );
+  }
+
+  try {
+    const body = (await request.json()) as Record<string, unknown>;
+    const created = await createLeadInDb({
+      fullName: String(body.fullName || ""),
+      phone: String(body.phone || ""),
+      email: body.email ? String(body.email) : undefined,
+      propertyType: body.propertyType ? String(body.propertyType) : undefined,
+      preferredLocation: body.preferredLocation ? String(body.preferredLocation) : undefined,
+      preferredArea: body.preferredArea ? String(body.preferredArea) : undefined,
+      preferredLanguage: body.preferredLanguage ? String(body.preferredLanguage) : undefined,
+      callConsent: body.callConsent === true || body.consentGranted === true,
+      source: body.source ? String(body.source) : "PUBLIC_WEBSITE",
+      rawBody: body
+    });
 
     return NextResponse.json(
       {
         success: true,
         message: "Your enquiry has been received successfully.",
-        lead: newLead,
-        referenceNumber,
-        matchedProperties: matched,
+        lead: created.lead,
+        referenceNumber: created.referenceNumber,
+        matchedProperties: created.matchedProperties,
         voiceCallRoom: {
-          roomId,
-          callUrl: `/call/${roomId}`
+          roomId: created.roomId,
+          callUrl: `/call/${created.roomId}`
         }
       },
       { status: 201 }
     );
   } catch (error) {
+    const msg = error instanceof Error ? error.message : "Internal server error";
+    if (msg.startsWith("VALIDATION:") || msg.startsWith("COMPLIANCE_VIOLATION:")) {
+      return NextResponse.json(
+        { success: false, message: msg.replace(/^(VALIDATION|COMPLIANCE_VIOLATION):\s*/, "") },
+        { status: 400 }
+      );
+    }
+    if (msg.startsWith("DUPLICATE:")) {
+      return NextResponse.json(
+        { success: false, message: msg.replace(/^DUPLICATE:\s*/, "") },
+        { status: 409 }
+      );
+    }
+    console.error("[POST /api/leads Error]:", redactPII(msg));
     return NextResponse.json(
-      { success: false, message: error instanceof Error ? error.message : "Internal server error" },
+      { success: false, message: "Unable to process enquiry at this time." },
       { status: 500 }
     );
   }
 }
 
 export async function PATCH(request: Request) {
+  const auth = await requireRole(
+    request,
+    ["SUPER_ADMIN", "ADMIN", "MANAGER", "EXECUTIVE"],
+    { requireCsrf: true }
+  );
+  if (!auth.authorized) return auth.response;
+
   try {
     const body = await request.json();
     const { leadId, status, assignedExecutive, notes, nextActionAt } = body;
 
-    const leadIndex = leadsState.findIndex((l) => l.id === leadId);
-    if (leadIndex === -1) {
-      return NextResponse.json({ success: false, message: "Lead not found." }, { status: 404 });
+    if (!leadId || typeof leadId !== "string") {
+      return NextResponse.json(
+        { success: false, message: "leadId is required." },
+        { status: 400 }
+      );
     }
 
-    const current = leadsState[leadIndex];
-    const updated: LeadRecord = {
-      ...current,
-      status: (status as LeadStatus) || current.status,
-      assignedExecutive: assignedExecutive || current.assignedExecutive,
-      notes: notes !== undefined ? notes : current.notes,
-      nextActionAt: nextActionAt !== undefined ? nextActionAt : current.nextActionAt,
-      updatedAt: new Date().toISOString()
-    };
-
-    leadsState[leadIndex] = updated;
+    const updated = await updateLeadInDb({
+      leadId,
+      status: status as LeadStatus | undefined,
+      assignedExecutive,
+      notes,
+      nextActionAt,
+      actor: auth.session.user
+    });
 
     return NextResponse.json({ success: true, lead: updated });
   } catch (error) {
+    const msg = error instanceof Error ? error.message : "Internal server error";
+    if (msg.startsWith("NOT_FOUND:")) {
+      return NextResponse.json(
+        { success: false, message: msg.replace(/^NOT_FOUND:\s*/, "") },
+        { status: 404 }
+      );
+    }
+    if (msg.startsWith("FORBIDDEN:")) {
+      return NextResponse.json(
+        { success: false, message: msg.replace(/^FORBIDDEN:\s*/, "") },
+        { status: 403 }
+      );
+    }
+    if (msg.startsWith("VALIDATION:")) {
+      return NextResponse.json(
+        { success: false, message: msg.replace(/^VALIDATION:\s*/, "") },
+        { status: 400 }
+      );
+    }
+    console.error("[PATCH /api/leads Error]:", redactPII(msg));
     return NextResponse.json(
-      { success: false, message: error instanceof Error ? error.message : "Internal server error" },
+      { success: false, message: "Failed to update lead." },
       { status: 500 }
     );
   }

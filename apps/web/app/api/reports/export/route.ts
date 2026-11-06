@@ -1,19 +1,38 @@
 import { NextResponse } from "next/server";
-import { INITIAL_CALLS, INITIAL_LEADS, INITIAL_PROPERTIES, INITIAL_SITE_VISITS } from "../../../lib/store";
+import { requireRole } from "../../../lib/auth";
+import { recordAuditEvent } from "../../../lib/db";
+import {
+  listCallsFromDb,
+  listLeadsFromDb,
+  listPropertiesFromDb,
+  listSiteVisitsFromDb
+} from "../../../lib/repositories";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
+  // Prevent unauthorized data exports: Only SUPER_ADMIN, ADMIN, and MANAGER can export CSV reports
+  const auth = await requireRole(request, ["SUPER_ADMIN", "ADMIN", "MANAGER"]);
+  if (!auth.authorized) return auth.response;
+
   const { searchParams } = new URL(request.url);
   const type = searchParams.get("type") || "daily-enquiries";
 
   let csvContent = "";
-  let filename = `estatepilot-${type}-${new Date().toISOString().slice(0, 10)}.csv`;
+  let exportedCount = 0;
+  const filename = `estatepilot-${type}-${new Date().toISOString().slice(0, 10)}.csv`;
 
-  // UTF-8 BOM ensures Excel natively opens and displays regional characters (Kannada, Telugu, Hindi) and rupee signs correctly!
+  // UTF-8 BOM ensures Excel natively opens and displays regional characters (Kannada, Telugu, Hindi) and rupee signs correctly
   const BOM = "\uFEFF";
 
-  if (type === "daily-enquiries" || type === "monthly-leads") {
+  if (type === "daily-enquiries" || type === "monthly-leads" || type === "weekly-performance") {
+    const { leads } = await listLeadsFromDb({
+      page: 1,
+      pageSize: 1000,
+      actor: auth.session.user
+    });
+    exportedCount = leads.length;
+
     const headers = [
       "Reference ID",
       "Full Name",
@@ -32,7 +51,7 @@ export async function GET(request: Request) {
       "AI Summary"
     ];
 
-    const rows = INITIAL_LEADS.map((lead) => [
+    const rows = leads.map((lead) => [
       lead.referenceNumber,
       `"${lead.fullName.replaceAll('"', '""')}"`,
       lead.phone,
@@ -52,6 +71,9 @@ export async function GET(request: Request) {
 
     csvContent = BOM + [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
   } else if (type === "call-summary") {
+    const calls = await listCallsFromDb();
+    exportedCount = calls.length;
+
     const headers = [
       "Call ID",
       "Customer Name",
@@ -64,7 +86,7 @@ export async function GET(request: Request) {
       "Summary"
     ];
 
-    const rows = INITIAL_CALLS.map((c) => [
+    const rows = calls.map((c) => [
       c.id,
       `"${c.customerName.replaceAll('"', '""')}"`,
       c.phone,
@@ -78,6 +100,9 @@ export async function GET(request: Request) {
 
     csvContent = BOM + [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
   } else if (type === "site-visits") {
+    const siteVisits = await listSiteVisitsFromDb();
+    exportedCount = siteVisits.length;
+
     const headers = [
       "Visit ID",
       "Customer Name",
@@ -89,7 +114,7 @@ export async function GET(request: Request) {
       "Notes"
     ];
 
-    const rows = INITIAL_SITE_VISITS.map((v) => [
+    const rows = siteVisits.map((v) => [
       v.id,
       `"${v.customerName.replaceAll('"', '""')}"`,
       v.phone,
@@ -102,6 +127,9 @@ export async function GET(request: Request) {
 
     csvContent = BOM + [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
   } else if (type === "property-category") {
+    const { properties } = await listPropertiesFromDb({ page: 1, pageSize: 1000 });
+    exportedCount = properties.length;
+
     const headers = [
       "Property ID",
       "Project Name",
@@ -115,7 +143,7 @@ export async function GET(request: Request) {
       "Possession Date"
     ];
 
-    const rows = INITIAL_PROPERTIES.map((p) => [
+    const rows = properties.map((p) => [
       p.id,
       `"${p.name.replaceAll('"', '""')}"`,
       p.category,
@@ -130,21 +158,78 @@ export async function GET(request: Request) {
 
     csvContent = BOM + [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
   } else {
-    // Executive / Conversion overview
-    const headers = ["Executive Name", "Total Assigned", "Contacted", "Visits Scheduled", "Visits Completed", "Converted", "Conversion Rate"];
-    const rows = [
-      ['"Rajesh Sharma (Senior Property Specialist)"', "18", "16", "9", "7", "4", "22.2%"],
-      ['"Priya Nair (Lead Relationship Manager)"', "14", "13", "6", "5", "3", "21.4%"],
-      ['"Suresh Kumar (Kannada Language Specialist)"', "12", "11", "5", "4", "2", "16.7%"]
+    // Sales Executive & Conversion aggregation computed directly from PostgreSQL leads
+    const { leads } = await listLeadsFromDb({ page: 1, pageSize: 1000, actor: auth.session.user });
+    const execStats = new Map<
+      string,
+      { assigned: number; contacted: number; visitsScheduled: number; visitsCompleted: number; converted: number }
+    >();
+
+    for (const l of leads) {
+      const name = l.assignedExecutive || "Unassigned";
+      const cur = execStats.get(name) || {
+        assigned: 0,
+        contacted: 0,
+        visitsScheduled: 0,
+        visitsCompleted: 0,
+        converted: 0
+      };
+      cur.assigned += 1;
+      if (l.status !== "NEW") cur.contacted += 1;
+      if (l.status === "SITE_VISIT_SCHEDULED" || l.status === "SITE_VISITED" || l.status === "CONVERTED") {
+        cur.visitsScheduled += 1;
+      }
+      if (l.status === "SITE_VISITED" || l.status === "CONVERTED") {
+        cur.visitsCompleted += 1;
+      }
+      if (l.status === "CONVERTED") {
+        cur.converted += 1;
+      }
+      execStats.set(name, cur);
+    }
+
+    const headers = [
+      "Executive Name",
+      "Total Assigned",
+      "Contacted",
+      "Visits Scheduled",
+      "Visits Completed",
+      "Converted",
+      "Conversion Rate"
     ];
+
+    const rows = Array.from(execStats.entries()).map(([execName, st]) => {
+      const rate = st.assigned > 0 ? `${((st.converted / st.assigned) * 100).toFixed(1)}%` : "0.0%";
+      return [
+        `"${execName.replaceAll('"', '""')}"`,
+        String(st.assigned),
+        String(st.contacted),
+        String(st.visitsScheduled),
+        String(st.visitsCompleted),
+        String(st.converted),
+        rate
+      ];
+    });
+
+    exportedCount = rows.length;
     csvContent = BOM + [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
   }
+
+  await recordAuditEvent(null, {
+    entityType: "REPORT",
+    entityId: type,
+    action: "REPORT_CSV_EXPORTED",
+    actorId: auth.session.user.id,
+    actorRole: auth.session.user.role,
+    details: { reportType: type, exportedRows: exportedCount }
+  });
 
   return new NextResponse(csvContent, {
     status: 200,
     headers: {
       "Content-Type": "text/csv; charset=utf-8",
-      "Content-Disposition": `attachment; filename="${filename}"`
+      "Content-Disposition": `attachment; filename="${filename}"`,
+      "Cache-Control": "no-store"
     }
   });
 }

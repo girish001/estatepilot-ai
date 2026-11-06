@@ -22,11 +22,21 @@ export default function KnowledgeBasePage() {
     description: "",
     brochureFileName: "Project-Brochure-2026.pdf"
   });
+  const [csrfToken, setCsrfToken] = useState("");
   const [uploadSuccessMsg, setUploadSuccessMsg] = useState("");
   const [apiErrorMsg, setApiErrorMsg] = useState("");
 
   useEffect(() => {
     let active = true;
+    fetch("/api/auth/me")
+      .then((res) => res.json().catch(() => null))
+      .then((authData) => {
+        if (active && authData?.csrfToken) {
+          setCsrfToken(authData.csrfToken);
+        }
+      })
+      .catch(() => {});
+
     fetch("/api/properties")
       .then(async (res) => {
         const data = await res.json().catch(() => null);
@@ -78,7 +88,10 @@ export default function KnowledgeBasePage() {
 
     fetch("/api/properties", {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-csrf-token": csrfToken
+      },
       body: JSON.stringify({ id, isVerified: nextState, verifiedBy })
     })
       .then(async (res) => {
@@ -132,7 +145,10 @@ export default function KnowledgeBasePage() {
 
     fetch("/api/properties", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-csrf-token": csrfToken
+      },
       body: JSON.stringify(newProp)
     })
       .then(async (res) => {
