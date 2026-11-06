@@ -1,0 +1,6 @@
+aiortc==1.13.0
+av==14.4.0
+faster-whisper==1.1.1
+numpy==2.2.6
+requests==2.32.4
+websockets==15.0.1
