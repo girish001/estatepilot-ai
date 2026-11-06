@@ -4,7 +4,11 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "EstatePilot AI",
-  description: "AI-powered real estate lead engagement and site-visit management."
+  description: "AI-powered real estate lead engagement and site-visit management.",
+  openGraph: {
+    title: "EstatePilot AI",
+    description: "AI-powered real estate lead engagement and site-visit management."
+  }
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
