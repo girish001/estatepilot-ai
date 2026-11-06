@@ -56,7 +56,19 @@ export default function CustomerCallPage() {
           if (message.role === "customer" && connection.signalingState === "stable") {
             const offer = await connection.createOffer();
             await connection.setLocalDescription(offer);
-            ws.send(JSON.stringify({ type: "offer", payload: offer }));
+            if (connection.iceGatheringState !== "complete") {
+              await new Promise<void>(resolve => {
+                const done = () => {
+                  if (connection.iceGatheringState === "complete") {
+                    connection.removeEventListener("icegatheringstatechange", done);
+                    resolve();
+                  }
+                };
+                connection.addEventListener("icegatheringstatechange", done);
+                window.setTimeout(resolve, 8000);
+              });
+            }
+            ws.send(JSON.stringify({ type: "offer", payload: connection.localDescription }));
           }
         } else if (message.type === "offer") {
           await connection.setRemoteDescription(message.payload as RTCSessionDescriptionInit);
