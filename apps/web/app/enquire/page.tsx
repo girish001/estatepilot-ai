@@ -1,6 +1,7 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { useState } from "react";
+import type { FormEvent } from "react";
 
 const propertyOptions = [
   { value: "PLOT", label: "Residential plot" },
@@ -23,7 +24,8 @@ export default function EnquiryPage() {
       return;
     }
 
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
     const payload = {
       fullName: String(form.get("fullName") || "").trim(),
       phone: `+91${phone}`,
@@ -53,7 +55,7 @@ export default function EnquiryPage() {
       if (!response.ok) {
         throw new Error(result.message || "Enquiry submission is not available yet. Please try again later.");
       }
-      event.currentTarget.reset();
+      formElement.reset();
       setPhone("");
       setMessage("Thank you. Your enquiry has been received. Our team will contact you shortly.");
     } catch (error) {
