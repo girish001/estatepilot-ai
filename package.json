@@ -1,15 +1,1 @@
-{
-  "name": "estatepilot-ai",
-  "private": true,
-  "version": "0.1.0",
-  "packageManager": "pnpm@9.15.0",
-  "scripts": {
-    "dev": "pnpm --parallel --filter @estatepilot/web --filter @estatepilot/api dev",
-    "build": "pnpm --recursive build",
-    "lint": "pnpm --recursive lint",
-    "typecheck": "pnpm --recursive typecheck"
-  },
-  "engines": {
-    "node": ">=20"
-  }
-}
+{"name":"estatepilot-ai","private":true,"version":"0.1.0","scripts":{"dev":"npm --prefix apps/web run dev","build":"npm --prefix apps/web run build","lint":"npm --prefix apps/web run lint","typecheck":"npm --prefix apps/web run typecheck"},"engines":{"node":">=20"}}

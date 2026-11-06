@@ -1,0 +1,6 @@
+{
+  "name": "EstatePilot AI",
+  "description": "AI-powered real estate lead engagement and site-visit management.",
+  "permissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

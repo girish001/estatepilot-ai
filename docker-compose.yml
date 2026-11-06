@@ -1,0 +1,97 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: estatepilot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-estatepilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-estatepilot_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-estatepilot_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U estatepilot -d estatepilot_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: estatepilot-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    container_name: estatepilot-api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-estatepilot}:${POSTGRES_PASSWORD:-estatepilot_secret}@postgres:5432/${POSTGRES_DB:-estatepilot_db}
+      REDIS_URL: redis://redis:6379
+      API_PORT: 4000
+      API_HOST: "0.0.0.0"
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
+      PUBLIC_WEB_ORIGIN: ${PUBLIC_WEB_ORIGIN:-http://localhost:3000}
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    container_name: estatepilot-web
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+      NEXT_PUBLIC_ICE_SERVERS: '[{"urls":"stun:stun.l.google.com:19302"}]'
+      DATABASE_URL: postgresql://${POSTGRES_USER:-estatepilot}:${POSTGRES_PASSWORD:-estatepilot_secret}@postgres:5432/${POSTGRES_DB:-estatepilot_db}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+  voice-agent:
+    build:
+      context: ./services/voice-agent
+      dockerfile: Dockerfile
+    container_name: estatepilot-voice-agent
+    restart: unless-stopped
+    environment:
+      ESTATEPILOT_SIGNAL_URL: ws://api:4000
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-int8}
+      PIPER_BIN: piper
+      PIPER_VOICE_EN: ${PIPER_VOICE_EN:-voices/en_US-lessac-medium.onnx}
+      PIPER_VOICE_KN: ${PIPER_VOICE_KN:-voices/kn_IN-voice.onnx}
+      PIPER_VOICE_TE: ${PIPER_VOICE_TE:-voices/te_IN-voice.onnx}
+      PIPER_VOICE_HI: ${PIPER_VOICE_HI:-voices/hi_IN-voice.onnx}
+    volumes:
+      - ./services/voice-agent/voices:/app/voices
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  redis_data:
