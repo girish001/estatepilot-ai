@@ -4,7 +4,7 @@
 - [x] Add product rules and pricing policy
 - [x] Add Next.js dashboard foundation
 - [x] Add Fastify API health endpoint
-- [ ] Add PostgreSQL schema and migrations
+- [x] Add initial PostgreSQL Prisma schema (migration generation pending)
 - [ ] Add authentication, roles, and tenant isolation
 - [ ] Add property inventory CRUD and rate verification
 - [ ] Add lead intake API and consent records
