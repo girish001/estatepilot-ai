@@ -53,7 +53,7 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   const ip = getClientIp(request);
-  const rateLimit = checkPublicEnquiryRateLimit(ip);
+  const rateLimit = await checkPublicEnquiryRateLimit(ip);
   if (!rateLimit.allowed) {
     return NextResponse.json(
       {
@@ -63,7 +63,10 @@ export async function POST(request: Request) {
       },
       {
         status: 429,
-        headers: { "Retry-After": String(rateLimit.retryAfterSeconds) }
+        headers: {
+          "Retry-After": String(rateLimit.retryAfterSeconds),
+          "Cache-Control": "no-store"
+        }
       }
     );
   }

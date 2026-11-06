@@ -13,7 +13,7 @@ import {
   type SiteVisitRecord,
   type SupportedLanguage
 } from "./store";
-import type { AdminUser } from "./auth";
+import { normalizeExecutiveIdentity, type AdminUser } from "./auth";
 
 export interface PaginationMeta {
   page: number;
@@ -34,6 +34,13 @@ export interface LeadMetrics {
   lost: number;
 }
 
+const VALID_LEAD_SOURCES = new Set([
+  "PUBLIC_WEBSITE",
+  "PHONE_INBOUND",
+  "REFERRAL",
+  "PROPERTY_PORTAL"
+]);
+
 /**
  * Queries ONLY verified properties from PostgreSQL for customer recommendations.
  */
@@ -50,7 +57,7 @@ export async function matchVerifiedPropertiesFromDb(
     [category]
   );
 
-  const verifiedList = res.rows.map((r) => r.record);
+  const verifiedList = res.rows.map((r) => r.record).filter((p) => p.isVerified === true);
   if (!preferredLocation || preferredLocation.trim().length === 0) {
     return verifiedList;
   }
@@ -99,7 +106,9 @@ export async function listPropertiesFromDb(params: {
   }
   if (params.q && params.q.trim().length > 0) {
     values.push(`%${params.q.trim()}%`);
-    conditions.push(`(name ILIKE $${values.length} OR location ILIKE $${values.length} OR city ILIKE $${values.length})`);
+    conditions.push(
+      `(name ILIKE $${values.length} OR location ILIKE $${values.length} OR city ILIKE $${values.length})`
+    );
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -263,7 +272,7 @@ export async function updatePropertyInDb(params: {
 
   return withTransaction(async (tx: DbClient) => {
     const existingRes = await tx.query<{ record: PropertyRecord }>(
-      "SELECT record FROM estatepilot.properties WHERE id = $1",
+      "SELECT record FROM estatepilot.properties WHERE id = $1 FOR UPDATE",
       [params.id]
     );
     if (existingRes.rowCount === 0) {
@@ -318,11 +327,12 @@ export async function updatePropertyInDb(params: {
     await recordAuditEvent(tx, {
       entityType: "PROPERTY",
       entityId: updated.id,
-      action: typeof params.isVerified === "boolean"
-        ? updated.isVerified
-          ? "PROPERTY_VERIFIED"
-          : "PROPERTY_VERIFICATION_REVOKED"
-        : "PROPERTY_UPDATED",
+      action:
+        typeof params.isVerified === "boolean"
+          ? updated.isVerified
+            ? "PROPERTY_VERIFIED"
+            : "PROPERTY_VERIFICATION_REVOKED"
+          : "PROPERTY_UPDATED",
       actorId: params.actor.id,
       actorRole: params.actor.role,
       details: {
@@ -337,7 +347,7 @@ export async function updatePropertyInDb(params: {
 }
 
 /**
- * Lists leads from PostgreSQL with filtering, search, pagination, and EXECUTIVE RBAC scoping.
+ * Lists leads from PostgreSQL with filtering, search, pagination, and exact EXECUTIVE RBAC scoping.
  */
 export async function listLeadsFromDb(params: {
   status?: string | null;
@@ -355,11 +365,35 @@ export async function listLeadsFromDb(params: {
   const conditions: string[] = [];
   const values: unknown[] = [];
 
-  // Role-based row filtering: EXECUTIVE can only access leads assigned to them
+  const page = Math.max(1, Number(params.page || 1));
+  const pageSize = Math.min(Math.max(1, Number(params.pageSize || 50)), 100);
+  const offset = (page - 1) * pageSize;
+
+  // Strict row-level isolation for EXECUTIVE role:
+  // Uses exact normalized equality on the executive's canonical name (never substring ILIKE).
+  // Fails closed if executiveDisplayName is missing.
+  let execIdentity = "";
   if (params.actor && params.actor.role === "EXECUTIVE") {
-    const execIdentifier = params.actor.executiveDisplayName || params.actor.fullName;
-    values.push(`%${execIdentifier}%`);
-    conditions.push(`assigned_executive ILIKE $${values.length}`);
+    execIdentity = normalizeExecutiveIdentity(params.actor.executiveDisplayName);
+    if (!execIdentity) {
+      return {
+        leads: [],
+        metrics: {
+          total: 0,
+          newLeads: 0,
+          contacted: 0,
+          interested: 0,
+          callbacksDue: 0,
+          siteVisitsScheduled: 0,
+          siteVisitsCompleted: 0,
+          converted: 0,
+          lost: 0
+        },
+        pagination: { page, pageSize, totalRecords: 0, totalPages: 1 }
+      };
+    }
+    values.push(execIdentity);
+    conditions.push(`LOWER(TRIM(SPLIT_PART(assigned_executive, ' (', 1))) = $${values.length}`);
   }
 
   if (params.status && params.status !== "ALL") {
@@ -382,17 +416,12 @@ export async function listLeadsFromDb(params: {
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-  const page = Math.max(1, Number(params.page || 1));
-  const pageSize = Math.min(Math.max(1, Number(params.pageSize || 50)), 100);
-  const offset = (page - 1) * pageSize;
 
-  // Scope metrics to executive if caller is EXECUTIVE
   const metricsConditions: string[] = [];
   const metricsValues: unknown[] = [];
   if (params.actor && params.actor.role === "EXECUTIVE") {
-    const execIdentifier = params.actor.executiveDisplayName || params.actor.fullName;
-    metricsValues.push(`%${execIdentifier}%`);
-    metricsConditions.push(`WHERE assigned_executive ILIKE $1`);
+    metricsValues.push(execIdentity);
+    metricsConditions.push(`WHERE LOWER(TRIM(SPLIT_PART(assigned_executive, ' (', 1))) = $1`);
   }
   const metricsWhere = metricsConditions.join(" ");
 
@@ -521,6 +550,10 @@ export async function createLeadInDb(params: {
     ? (params.preferredLanguage as SupportedLanguage)
     : "English";
 
+  const normalizedSource: LeadRecord["source"] = VALID_LEAD_SOURCES.has(String(params.source || ""))
+    ? (params.source as LeadRecord["source"])
+    : "PUBLIC_WEBSITE";
+
   const cleanEmail = params.email ? String(params.email).trim() : undefined;
   if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
     throw new Error("VALIDATION: Please provide a valid email address.");
@@ -564,7 +597,7 @@ export async function createLeadInDb(params: {
       fullName: cleanName,
       phone: formattedPhone,
       email: cleanEmail,
-      source: (params.source as LeadRecord["source"]) || "PUBLIC_WEBSITE",
+      source: normalizedSource,
       propertyType: category,
       preferredLocation: params.preferredLocation ? String(params.preferredLocation).trim() : "Bangalore",
       preferredArea: params.preferredArea ? String(params.preferredArea).trim() : "Standard",
@@ -652,7 +685,7 @@ export async function createLeadInDb(params: {
 }
 
 /**
- * Updates an existing lead in PostgreSQL inside an atomic transaction with RBAC checks.
+ * Updates an existing lead in PostgreSQL inside an atomic transaction with row-locking and exact RBAC checks.
  */
 export async function updateLeadInDb(params: {
   leadId: string;
@@ -679,8 +712,12 @@ export async function updateLeadInDb(params: {
   }
 
   return withTransaction(async (tx: DbClient) => {
-    const existingRes = await tx.query<{ record: LeadRecord; assigned_executive: string }>(
-      "SELECT record, assigned_executive FROM estatepilot.leads WHERE id = $1",
+    const existingRes = await tx.query<{
+      record: LeadRecord;
+      assigned_executive: string;
+      consent_granted: boolean;
+    }>(
+      "SELECT record, assigned_executive, consent_granted FROM estatepilot.leads WHERE id = $1 FOR UPDATE",
       [params.leadId]
     );
 
@@ -688,24 +725,42 @@ export async function updateLeadInDb(params: {
       throw new Error("NOT_FOUND: Lead not found.");
     }
 
-    const current = existingRes.rows[0].record;
+    const row = existingRes.rows[0];
+    const current = row.record;
 
-    // RBAC Check for EXECUTIVE role
+    // Exact, fail-closed RBAC Check for EXECUTIVE role
     if (params.actor.role === "EXECUTIVE") {
-      const execIdent = (params.actor.executiveDisplayName || params.actor.fullName).toLowerCase();
-      if (!current.assignedExecutive.toLowerCase().includes(execIdent)) {
+      const execIdent = normalizeExecutiveIdentity(params.actor.executiveDisplayName);
+      const dbAssignedIdent = normalizeExecutiveIdentity(row.assigned_executive);
+      const recordAssignedIdent = normalizeExecutiveIdentity(current.assignedExecutive);
+
+      if (!execIdent || dbAssignedIdent !== execIdent || recordAssignedIdent !== execIdent) {
         throw new Error("FORBIDDEN: Executives can only access and update leads assigned to them.");
       }
-      if (params.assignedExecutive && params.assignedExecutive !== current.assignedExecutive) {
+
+      if (
+        params.assignedExecutive !== undefined &&
+        normalizeExecutiveIdentity(params.assignedExecutive) !== execIdent
+      ) {
         throw new Error("FORBIDDEN: Executives are not permitted to reassign leads to other specialists.");
       }
     }
 
     const nowIso = new Date().toISOString();
+    const nextStatus = params.status || current.status;
+    const nextConsentGranted =
+      nextStatus === "DO_NOT_CONTACT" ? false : Boolean(row.consent_granted && current.consent.granted);
+
     const updated: LeadRecord = {
       ...current,
-      status: params.status || current.status,
-      assignedExecutive: params.assignedExecutive ? String(params.assignedExecutive).trim() : current.assignedExecutive,
+      status: nextStatus,
+      consent: {
+        ...current.consent,
+        granted: nextConsentGranted
+      },
+      assignedExecutive: params.assignedExecutive
+        ? String(params.assignedExecutive).trim()
+        : current.assignedExecutive,
       notes: params.notes !== undefined ? String(params.notes) : current.notes,
       nextActionAt:
         params.nextActionAt !== undefined
@@ -720,13 +775,15 @@ export async function updateLeadInDb(params: {
       `UPDATE estatepilot.leads
        SET status = $1,
            assigned_executive = $2,
-           next_action_at = $3,
-           record = $4::jsonb,
+           consent_granted = $3,
+           next_action_at = $4,
+           record = $5::jsonb,
            updated_at = NOW()
-       WHERE id = $5`,
+       WHERE id = $6`,
       [
         updated.status,
         updated.assignedExecutive,
+        nextConsentGranted,
         updated.nextActionAt ?? null,
         JSON.stringify(updated),
         updated.id
@@ -743,6 +800,7 @@ export async function updateLeadInDb(params: {
         previousStatus: current.status,
         newStatus: updated.status,
         assignedExecutive: updated.assignedExecutive,
+        consentGranted: nextConsentGranted,
         nextActionAt: updated.nextActionAt ?? null
       }
     });
@@ -754,7 +812,20 @@ export async function updateLeadInDb(params: {
 /**
  * Lists site visits and call logs from PostgreSQL for reporting and follow-up views.
  */
-export async function listSiteVisitsFromDb(): Promise<SiteVisitRecord[]> {
+export async function listSiteVisitsFromDb(actor?: AdminUser | null): Promise<SiteVisitRecord[]> {
+  if (actor && actor.role === "EXECUTIVE") {
+    const execIdent = normalizeExecutiveIdentity(actor.executiveDisplayName);
+    if (!execIdent) return [];
+    const res = await dbQuery<{ record: SiteVisitRecord }>(
+      `SELECT record
+       FROM estatepilot.site_visits
+       WHERE LOWER(TRIM(SPLIT_PART(assigned_executive, ' (', 1))) = $1
+       ORDER BY scheduled_at ASC`,
+      [execIdent]
+    );
+    return res.rows.map((r) => r.record);
+  }
+
   const res = await dbQuery<{ record: SiteVisitRecord }>(
     "SELECT record FROM estatepilot.site_visits ORDER BY scheduled_at ASC"
   );

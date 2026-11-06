@@ -27,51 +27,119 @@ const SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 hours
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 minutes
 
-// Sliding-window rate limiters for login and public enquiry endpoints
-const loginIpBuckets = new Map<string, { count: number; resetAt: number }>();
-const publicEnquiryIpBuckets = new Map<string, { count: number; resetAt: number }>();
-
-export function checkRateLimit(
-  bucketMap: Map<string, { count: number; resetAt: number }>,
-  key: string,
-  maxRequests: number,
-  windowMs: number
-): { allowed: boolean; retryAfterSeconds: number } {
-  const now = Date.now();
-  const current = bucketMap.get(key);
-  if (!current || current.resetAt <= now) {
-    bucketMap.set(key, { count: 1, resetAt: now + windowMs });
-    return { allowed: true, retryAfterSeconds: 0 };
-  }
-  if (current.count >= maxRequests) {
-    return {
-      allowed: false,
-      retryAfterSeconds: Math.max(1, Math.ceil((current.resetAt - now) / 1000))
-    };
-  }
-  current.count += 1;
-  return { allowed: true, retryAfterSeconds: 0 };
-}
-
-export function checkLoginRateLimit(ip: string) {
-  return checkRateLimit(loginIpBuckets, ip, 10, 15 * 60 * 1000);
-}
-
-export function checkPublicEnquiryRateLimit(ip: string) {
-  return checkRateLimit(publicEnquiryIpBuckets, ip, 15, 10 * 60 * 1000);
-}
-
-export function resetRateLimitsForTests() {
-  loginIpBuckets.clear();
-  publicEnquiryIpBuckets.clear();
+/**
+ * Normalizes an executive's display name (e.g. "Suresh Kumar (Kannada Language Specialist)" -> "suresh kumar")
+ * for exact, wildcard-safe identity matching across SQL and application layers.
+ */
+export function normalizeExecutiveIdentity(value: string | null | undefined): string {
+  if (!value || typeof value !== "string") return "";
+  return value.split(" (")[0].trim().toLowerCase();
 }
 
 /**
- * Hashes a password using scrypt with a 16-byte random salt.
+ * Constant-time string comparison using SHA-256 digests to prevent timing side-channels.
+ */
+export function constantTimeStringEqual(a: string, b: string): boolean {
+  if (typeof a !== "string" || typeof b !== "string" || a.length === 0 || b.length === 0) {
+    return false;
+  }
+  const digestA = createHash("sha256").update(a, "utf8").digest();
+  const digestB = createHash("sha256").update(b, "utf8").digest();
+  return timingSafeEqual(digestA, digestB) && a.length === b.length;
+}
+
+/**
+ * Distributed PostgreSQL-backed sliding/fixed-window rate limiter stored in estatepilot.rate_limit_buckets.
+ * Replaces process-local in-memory Maps so rate limits hold across serverless/container instances.
+ */
+export async function consumeRateLimitBucket(
+  bucketKey: string,
+  maxRequests: number,
+  windowMs: number
+): Promise<{ allowed: boolean; retryAfterSeconds: number; requestCount: number }> {
+  const safeWindowSeconds = Math.max(1, Math.ceil(windowMs / 1000));
+
+  // Opportunistically prune expired rate-limit rows (non-blocking)
+  await dbQuery(
+    `DELETE FROM estatepilot.rate_limit_buckets WHERE expires_at <= NOW() AND bucket_key <> $1`,
+    [bucketKey]
+  ).catch(() => {});
+
+  const res = await dbQuery<{ request_count: number; retry_after_seconds: number }>(
+    `INSERT INTO estatepilot.rate_limit_buckets (
+       bucket_key, request_count, window_started_at, expires_at
+     ) VALUES (
+       $1, 1, NOW(), NOW() + ($2 || ' seconds')::interval
+     )
+     ON CONFLICT (bucket_key) DO UPDATE
+       SET request_count = CASE
+             WHEN estatepilot.rate_limit_buckets.expires_at <= NOW() THEN 1
+             ELSE estatepilot.rate_limit_buckets.request_count + 1
+           END,
+           window_started_at = CASE
+             WHEN estatepilot.rate_limit_buckets.expires_at <= NOW() THEN NOW()
+             ELSE estatepilot.rate_limit_buckets.window_started_at
+           END,
+           expires_at = CASE
+             WHEN estatepilot.rate_limit_buckets.expires_at <= NOW()
+               THEN NOW() + ($2 || ' seconds')::interval
+             ELSE estatepilot.rate_limit_buckets.expires_at
+           END
+     RETURNING
+       request_count,
+       GREATEST(1, CEIL(EXTRACT(EPOCH FROM (expires_at - NOW()))))::int AS retry_after_seconds`,
+    [bucketKey, String(safeWindowSeconds)]
+  );
+
+  const row = res.rows[0];
+  const count = Number(row?.request_count ?? 1);
+  const retryAfterSeconds = Number(row?.retry_after_seconds ?? safeWindowSeconds);
+
+  return {
+    allowed: count <= maxRequests,
+    retryAfterSeconds: count <= maxRequests ? 0 : retryAfterSeconds,
+    requestCount: count
+  };
+}
+
+export async function checkLoginRateLimit(ip: string): Promise<{
+  allowed: boolean;
+  retryAfterSeconds: number;
+}> {
+  return consumeRateLimitBucket(`login_ip:${ip}`, 10, 15 * 60 * 1000);
+}
+
+export async function checkPublicEnquiryRateLimit(ip: string): Promise<{
+  allowed: boolean;
+  retryAfterSeconds: number;
+}> {
+  return consumeRateLimitBucket(`enquiry_ip:${ip}`, 15, 10 * 60 * 1000);
+}
+
+export async function resetRateLimitsForTests(): Promise<void> {
+  await dbQuery("DELETE FROM estatepilot.rate_limit_buckets").catch(() => {});
+}
+
+export function validatePasswordStrength(password: string): string | null {
+  if (!password || typeof password !== "string" || password.length < 10) {
+    return "Password must be at least 10 characters long.";
+  }
+  if (password.length > 128) {
+    return "Password must not exceed 128 characters.";
+  }
+  if (!/[A-Z]/.test(password) || !/[a-z]/.test(password) || !/[0-9]/.test(password)) {
+    return "Password must include at least one uppercase letter, one lowercase letter, and one digit.";
+  }
+  return null;
+}
+
+/**
+ * Hashes a password using scrypt with a 16-byte random salt after validating strength.
  */
 export function hashPassword(password: string): string {
-  if (!password || password.length < 10) {
-    throw new Error("Password must be at least 10 characters long.");
+  const validationError = validatePasswordStrength(password);
+  if (validationError) {
+    throw new Error(validationError);
   }
   const salt = randomBytes(16).toString("hex");
   const derivedKey = scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 }).toString("hex");
@@ -83,6 +151,7 @@ export function hashPassword(password: string): string {
  */
 export function verifyPassword(password: string, storedHash: string): boolean {
   try {
+    if (!password || password.length > 128) return false;
     const parts = storedHash.split("$");
     if (parts.length !== 3 || parts[0] !== "scrypt") return false;
     const [, salt, keyHex] = parts;
@@ -127,14 +196,114 @@ export async function getAdminUserCount(): Promise<number> {
 
 export const countAdminUsers = getAdminUserCount;
 
-export function validatePasswordStrength(password: string): string | null {
-  if (!password || password.length < 10) {
-    return "Password must be at least 10 characters long.";
+/**
+ * Validates the first-admin bootstrap token on a fail-closed basis.
+ * If ADMIN_BOOTSTRAP_TOKEN is not configured or shorter than 16 chars, bootstrap is disabled.
+ */
+export function verifyBootstrapTokenOrThrow(providedToken: unknown): void {
+  const configuredToken = process.env.ADMIN_BOOTSTRAP_TOKEN?.trim() || "";
+  if (configuredToken.length < 16) {
+    throw new Error(
+      "BOOTSTRAP_DISABLED: ADMIN_BOOTSTRAP_TOKEN is not configured on the server (minimum 16 characters required). First-admin bootstrap is disabled."
+    );
   }
-  if (!/[A-Z]/.test(password) || !/[a-z]/.test(password) || !/[0-9]/.test(password)) {
-    return "Password must include at least one uppercase letter, one lowercase letter, and one digit.";
+  if (typeof providedToken !== "string" || !constantTimeStringEqual(providedToken.trim(), configuredToken)) {
+    throw new Error(
+      "INVALID_BOOTSTRAP_TOKEN: Valid ADMIN_BOOTSTRAP_TOKEN is required to provision the first Super Admin."
+    );
   }
-  return null;
+}
+
+/**
+ * Concurrency-safe first SUPER_ADMIN provisioning.
+ * Acquires an exclusive table lock on estatepilot.admin_users inside a transaction and relies on
+ * the unique partial index estatepilot_single_bootstrap_admin_idx so concurrent requests cannot
+ * create multiple bootstrap admins.
+ */
+export async function bootstrapFirstSuperAdmin(params: {
+  email: string;
+  fullName: string;
+  password: string;
+  bootstrapToken: unknown;
+  ipAddress?: string;
+}): Promise<AdminUser> {
+  verifyBootstrapTokenOrThrow(params.bootstrapToken);
+
+  const cleanEmail = params.email.trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    throw new Error("A valid email address is required.");
+  }
+  if (!params.fullName || params.fullName.trim().length < 2) {
+    throw new Error("Full name is required.");
+  }
+
+  const passwordHash = hashPassword(params.password);
+  const userId = `usr-${randomBytes(8).toString("hex")}`;
+
+  try {
+    return await withTransaction(async (tx: DbClient) => {
+      // Serialize concurrent bootstrap transactions via exclusive table lock
+      await tx.query("LOCK TABLE estatepilot.admin_users IN EXCLUSIVE MODE");
+
+      const countRes = await tx.query<{ cnt: number }>(
+        "SELECT COUNT(*)::int AS cnt FROM estatepilot.admin_users"
+      );
+      if (Number(countRes.rows[0]?.cnt ?? 0) > 0) {
+        throw new Error(
+          "ALREADY_PROVISIONED: Initial Super Admin has already been provisioned. Please sign in or ask a Super Admin to create your account."
+        );
+      }
+
+      const insertRes = await tx.query<{
+        id: string;
+        email: string;
+        full_name: string;
+        role: AdminRole;
+        executive_display_name: string | null;
+        is_active: boolean;
+        last_login_at: string | null;
+        created_at: string;
+      }>(
+        `INSERT INTO estatepilot.admin_users (
+          id, email, full_name, password_hash, role, executive_display_name, is_bootstrap_admin, is_active
+        ) VALUES ($1, $2, $3, $4, 'SUPER_ADMIN', NULL, TRUE, TRUE)
+        RETURNING id, email, full_name, role, executive_display_name, is_active, last_login_at, created_at`,
+        [userId, cleanEmail, params.fullName.trim(), passwordHash]
+      );
+
+      const row = insertRes.rows[0];
+      await recordAuditEvent(tx, {
+        entityType: "USER",
+        entityId: row.id,
+        action: "BOOTSTRAP_SUPER_ADMIN_CREATED",
+        actorId: row.id,
+        actorRole: "SUPER_ADMIN",
+        details: {
+          ipAddress: params.ipAddress ?? null
+        }
+      });
+
+      return {
+        id: row.id,
+        email: row.email,
+        fullName: row.full_name,
+        role: row.role,
+        executiveDisplayName: row.executive_display_name,
+        isActive: row.is_active,
+        lastLoginAt: row.last_login_at,
+        createdAt: row.created_at
+      };
+    });
+  } catch (err) {
+    const code = (err as { code?: string })?.code;
+    const msg = err instanceof Error ? err.message : String(err);
+    if (code === "23505" || msg.includes("estatepilot_single_bootstrap_admin_idx")) {
+      throw new Error(
+        "ALREADY_PROVISIONED: Initial Super Admin has already been provisioned by a concurrent request."
+      );
+    }
+    throw err;
+  }
 }
 
 /**
@@ -160,6 +329,11 @@ export async function createAdminUser(params: {
     throw new Error("Invalid role specified.");
   }
 
+  const trimmedExecScope = params.executiveDisplayName?.trim() || null;
+  if (params.role === "EXECUTIVE" && (!trimmedExecScope || normalizeExecutiveIdentity(trimmedExecScope).length < 2)) {
+    throw new Error("EXECUTIVE role requires a non-empty executiveDisplayName scope.");
+  }
+
   const passwordHash = hashPassword(params.password);
   const userId = `usr-${randomBytes(8).toString("hex")}`;
 
@@ -183,8 +357,8 @@ export async function createAdminUser(params: {
       created_at: string;
     }>(
       `INSERT INTO estatepilot.admin_users (
-        id, email, full_name, password_hash, role, executive_display_name, is_active
-      ) VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+        id, email, full_name, password_hash, role, executive_display_name, is_bootstrap_admin, is_active
+      ) VALUES ($1, $2, $3, $4, $5, $6, FALSE, TRUE)
       RETURNING id, email, full_name, role, executive_display_name, is_active, last_login_at, created_at`,
       [
         userId,
@@ -192,7 +366,7 @@ export async function createAdminUser(params: {
         params.fullName.trim(),
         passwordHash,
         params.role,
-        params.executiveDisplayName?.trim() || null
+        trimmedExecScope
       ]
     );
 
@@ -391,14 +565,15 @@ export async function getSessionFromRequest(request: Request): Promise<Authentic
             u.is_active, u.last_login_at, u.created_at
      FROM estatepilot.admin_sessions s
      INNER JOIN estatepilot.admin_users u ON u.id = s.user_id
-     WHERE s.token_hash = $1`,
+     WHERE s.token_hash = $1
+       AND s.revoked_at IS NULL
+       AND s.expires_at > NOW()
+       AND u.is_active = TRUE`,
     [tokenHash]
   );
 
   if (res.rowCount === 0) return null;
   const row = res.rows[0];
-  if (row.revoked_at || !row.is_active) return null;
-  if (new Date(row.expires_at).getTime() <= Date.now()) return null;
 
   return {
     sessionId: row.session_id,
@@ -418,11 +593,21 @@ export async function getSessionFromRequest(request: Request): Promise<Authentic
 }
 
 /**
- * Revokes an active session on logout.
+ * Revokes an active session on logout after validating CSRF token if provided or required.
  */
-export async function revokeSessionByRequest(request: Request): Promise<void> {
+export async function revokeSessionByRequest(
+  request: Request,
+  options: { requireCsrf?: boolean } = {}
+): Promise<{ revoked: boolean; csrfError?: boolean }> {
   const session = await getSessionFromRequest(request);
-  if (!session) return;
+  if (!session) return { revoked: false };
+
+  if (options.requireCsrf) {
+    const headerCsrf = request.headers.get("x-csrf-token") || "";
+    if (!constantTimeStringEqual(headerCsrf, session.csrfToken)) {
+      return { revoked: false, csrfError: true };
+    }
+  }
 
   await withTransaction(async (tx) => {
     await tx.query(
@@ -438,10 +623,12 @@ export async function revokeSessionByRequest(request: Request): Promise<void> {
       details: { sessionId: session.sessionId }
     });
   });
+
+  return { revoked: true };
 }
 
 /**
- * Enforces authentication and role-based access control (RBAC) + CSRF protection on server APIs.
+ * Enforces authentication and role-based access control (RBAC) + constant-time CSRF protection on server APIs.
  */
 export async function requireRole(
   request: Request,
@@ -461,7 +648,7 @@ export async function requireRole(
           code: "UNAUTHENTICATED",
           message: "Authentication is required to access this administrative resource."
         },
-        { status: 401 }
+        { status: 401, headers: { "Cache-Control": "no-store" } }
       )
     };
   }
@@ -484,15 +671,24 @@ export async function requireRole(
           code: "FORBIDDEN",
           message: `Insufficient permissions. Required role: ${allowedRoles.join(" or ")}. Your role: ${session.user.role}.`
         },
-        { status: 403 }
+        { status: 403, headers: { "Cache-Control": "no-store" } }
       )
     };
   }
 
   const isMutating = ["POST", "PATCH", "PUT", "DELETE"].includes(request.method.toUpperCase());
   if ((options.requireCsrf ?? isMutating) && isMutating) {
-    const headerCsrf = request.headers.get("x-csrf-token");
-    if (!headerCsrf || headerCsrf !== session.csrfToken) {
+    const headerCsrf = request.headers.get("x-csrf-token") || "";
+    if (!constantTimeStringEqual(headerCsrf, session.csrfToken)) {
+      await recordAuditEvent(null, {
+        entityType: "AUTH",
+        entityId: session.user.id,
+        action: "CSRF_VALIDATION_FAILED",
+        actorId: session.user.id,
+        actorRole: session.user.role,
+        details: { method: request.method }
+      });
+
       return {
         authorized: false,
         response: NextResponse.json(
@@ -501,7 +697,7 @@ export async function requireRole(
             code: "CSRF_INVALID",
             message: "Invalid or missing CSRF security token (x-csrf-token)."
           },
-          { status: 403 }
+          { status: 403, headers: { "Cache-Control": "no-store" } }
         )
       };
     }
@@ -517,5 +713,6 @@ export function buildSessionCookieHeader(rawToken: string): string {
 }
 
 export function buildClearSessionCookieHeader(): string {
-  return `${SESSION_COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0`;
+  const isProd = process.env.NODE_ENV === "production";
+  return `${SESSION_COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0${isProd ? "; Secure" : ""}`;
 }

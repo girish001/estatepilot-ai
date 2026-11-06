@@ -7,7 +7,7 @@ applications:
           commands:
             - node -v
             - npm -v
-            - npm install --include=dev
+            - npm ci --include=dev --no-audit --no-fund || (rm -rf node_modules ../../node_modules && npm install --include=dev --no-audit --no-fund)
         build:
           commands:
             - npm run typecheck
@@ -19,5 +19,4 @@ applications:
       cache:
         paths:
           - .next/cache/**/*
-          - node_modules/**/*
-          - ../../node_modules/**/*
+          - ~/.npm/**/*

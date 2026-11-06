@@ -10,6 +10,22 @@ import {
 
 export const dynamic = "force-dynamic";
 
+/**
+ * Prevents CSV Formula Injection (CSV/Excel DDE & formula execution) by prefixing
+ * values starting with =, +, -, @, tab, or carriage return with a single quote ('),
+ * and wrapping strings in RFC-4180 double quotes.
+ */
+function sanitizeCsvCell(raw: string | number | boolean | null | undefined): string {
+  const str = String(raw ?? "");
+  const trimmedLeading = str.replace(/^[\s\u0000-\u001f]+/, "");
+  const needsFormulaGuard =
+    /^[=+\-@]/.test(str) ||
+    /^[=+\-@]/.test(trimmedLeading) ||
+    /^[\t\r\n]/.test(str);
+  const safeValue = needsFormulaGuard ? `'${str}` : str;
+  return `"${safeValue.replaceAll('"', '""')}"`;
+}
+
 export async function GET(request: Request) {
   // Prevent unauthorized data exports: Only SUPER_ADMIN, ADMIN, and MANAGER can export CSV reports
   const auth = await requireRole(request, ["SUPER_ADMIN", "ADMIN", "MANAGER"]);
@@ -20,7 +36,8 @@ export async function GET(request: Request) {
 
   let csvContent = "";
   let exportedCount = 0;
-  const filename = `estatepilot-${type}-${new Date().toISOString().slice(0, 10)}.csv`;
+  const safeTypeSlug = type.replace(/[^a-z0-9-_]/gi, "_").slice(0, 40) || "daily-enquiries";
+  const filename = `estatepilot-${safeTypeSlug}-${new Date().toISOString().slice(0, 10)}.csv`;
 
   // UTF-8 BOM ensures Excel natively opens and displays regional characters (Kannada, Telugu, Hindi) and rupee signs correctly
   const BOM = "\uFEFF";
@@ -52,21 +69,21 @@ export async function GET(request: Request) {
     ];
 
     const rows = leads.map((lead) => [
-      lead.referenceNumber,
-      `"${lead.fullName.replaceAll('"', '""')}"`,
-      lead.phone,
-      lead.email || "",
-      lead.source,
-      lead.propertyType,
-      `"${lead.preferredLocation.replaceAll('"', '""')}"`,
-      `"${lead.preferredArea.replaceAll('"', '""')}"`,
-      lead.preferredLanguage,
-      lead.status,
-      lead.consent.granted ? "YES" : "NO",
-      lead.consent.capturedAt,
-      `"${lead.assignedExecutive.replaceAll('"', '""')}"`,
-      lead.nextActionAt || "",
-      `"${(lead.aiConversationSummary || "").replaceAll('"', '""')}"`
+      sanitizeCsvCell(lead.referenceNumber),
+      sanitizeCsvCell(lead.fullName),
+      sanitizeCsvCell(lead.phone),
+      sanitizeCsvCell(lead.email || ""),
+      sanitizeCsvCell(lead.source),
+      sanitizeCsvCell(lead.propertyType),
+      sanitizeCsvCell(lead.preferredLocation),
+      sanitizeCsvCell(lead.preferredArea),
+      sanitizeCsvCell(lead.preferredLanguage),
+      sanitizeCsvCell(lead.status),
+      sanitizeCsvCell(lead.consent.granted ? "YES" : "NO"),
+      sanitizeCsvCell(lead.consent.capturedAt),
+      sanitizeCsvCell(lead.assignedExecutive),
+      sanitizeCsvCell(lead.nextActionAt || ""),
+      sanitizeCsvCell(lead.aiConversationSummary || "")
     ]);
 
     csvContent = BOM + [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
@@ -87,20 +104,20 @@ export async function GET(request: Request) {
     ];
 
     const rows = calls.map((c) => [
-      c.id,
-      `"${c.customerName.replaceAll('"', '""')}"`,
-      c.phone,
-      c.language,
-      c.startedAt,
-      c.durationSeconds,
-      c.status,
-      `"${c.matchedPropertyNames.join("; ")}"`,
-      `"${c.summary.replaceAll('"', '""')}"`
+      sanitizeCsvCell(c.id),
+      sanitizeCsvCell(c.customerName),
+      sanitizeCsvCell(c.phone),
+      sanitizeCsvCell(c.language),
+      sanitizeCsvCell(c.startedAt),
+      String(c.durationSeconds),
+      sanitizeCsvCell(c.status),
+      sanitizeCsvCell(c.matchedPropertyNames.join("; ")),
+      sanitizeCsvCell(c.summary)
     ]);
 
     csvContent = BOM + [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
   } else if (type === "site-visits") {
-    const siteVisits = await listSiteVisitsFromDb();
+    const siteVisits = await listSiteVisitsFromDb(auth.session.user);
     exportedCount = siteVisits.length;
 
     const headers = [
@@ -115,14 +132,14 @@ export async function GET(request: Request) {
     ];
 
     const rows = siteVisits.map((v) => [
-      v.id,
-      `"${v.customerName.replaceAll('"', '""')}"`,
-      v.phone,
-      `"${v.propertyName.replaceAll('"', '""')}"`,
-      v.scheduledAt,
-      v.status,
-      `"${v.assignedExecutive.replaceAll('"', '""')}"`,
-      `"${v.notes.replaceAll('"', '""')}"`
+      sanitizeCsvCell(v.id),
+      sanitizeCsvCell(v.customerName),
+      sanitizeCsvCell(v.phone),
+      sanitizeCsvCell(v.propertyName),
+      sanitizeCsvCell(v.scheduledAt),
+      sanitizeCsvCell(v.status),
+      sanitizeCsvCell(v.assignedExecutive),
+      sanitizeCsvCell(v.notes)
     ]);
 
     csvContent = BOM + [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
@@ -144,16 +161,16 @@ export async function GET(request: Request) {
     ];
 
     const rows = properties.map((p) => [
-      p.id,
-      `"${p.name.replaceAll('"', '""')}"`,
-      p.category,
-      `"${p.location.replaceAll('"', '""')}"`,
-      p.city,
-      p.approvedRatePerSqFt,
-      p.reraNumber,
-      p.isVerified ? "VERIFIED" : "PENDING_VERIFICATION",
-      `"${p.verifiedBy.replaceAll('"', '""')}"`,
-      `"${p.possessionDate.replaceAll('"', '""')}"`
+      sanitizeCsvCell(p.id),
+      sanitizeCsvCell(p.name),
+      sanitizeCsvCell(p.category),
+      sanitizeCsvCell(p.location),
+      sanitizeCsvCell(p.city),
+      String(p.approvedRatePerSqFt),
+      sanitizeCsvCell(p.reraNumber),
+      sanitizeCsvCell(p.isVerified ? "VERIFIED" : "PENDING_VERIFICATION"),
+      sanitizeCsvCell(p.verifiedBy),
+      sanitizeCsvCell(p.possessionDate)
     ]);
 
     csvContent = BOM + [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
@@ -201,13 +218,13 @@ export async function GET(request: Request) {
     const rows = Array.from(execStats.entries()).map(([execName, st]) => {
       const rate = st.assigned > 0 ? `${((st.converted / st.assigned) * 100).toFixed(1)}%` : "0.0%";
       return [
-        `"${execName.replaceAll('"', '""')}"`,
+        sanitizeCsvCell(execName),
         String(st.assigned),
         String(st.contacted),
         String(st.visitsScheduled),
         String(st.visitsCompleted),
         String(st.converted),
-        rate
+        sanitizeCsvCell(rate)
       ];
     });
 
@@ -217,11 +234,11 @@ export async function GET(request: Request) {
 
   await recordAuditEvent(null, {
     entityType: "REPORT",
-    entityId: type,
+    entityId: safeTypeSlug,
     action: "REPORT_CSV_EXPORTED",
     actorId: auth.session.user.id,
     actorRole: auth.session.user.role,
-    details: { reportType: type, exportedRows: exportedCount }
+    details: { reportType: safeTypeSlug, exportedRows: exportedCount }
   });
 
   return new NextResponse(csvContent, {

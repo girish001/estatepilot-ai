@@ -1,9 +1,8 @@
 import { NextResponse } from "next/server";
 import {
   authenticateAdmin,
+  bootstrapFirstSuperAdmin,
   buildSessionCookieHeader,
-  createAdminUser,
-  getAdminUserCount,
   getClientIp
 } from "../../../lib/auth";
 import { seedReviewedBaselineData } from "../../../lib/repositories";
@@ -12,43 +11,23 @@ export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
   try {
-    const existingCount = await getAdminUserCount();
-    if (existingCount > 0) {
-      return NextResponse.json(
-        {
-          success: false,
-          code: "ALREADY_PROVISIONED",
-          message: "Initial Super Admin has already been provisioned. Please sign in or ask a Super Admin to create your account."
-        },
-        { status: 403 }
-      );
-    }
-
     const body = await request.json();
-    const requiredBootstrapToken = process.env.ADMIN_BOOTSTRAP_TOKEN;
-    if (requiredBootstrapToken && body?.bootstrapToken !== requiredBootstrapToken) {
-      return NextResponse.json(
-        {
-          success: false,
-          code: "INVALID_BOOTSTRAP_TOKEN",
-          message: "Valid ADMIN_BOOTSTRAP_TOKEN is required to provision the first Super Admin."
-        },
-        { status: 403 }
-      );
-    }
+    const ip = getClientIp(request);
+    const userAgent = request.headers.get("user-agent") || "unknown";
 
     const email = String(body?.email || "").trim();
     const fullName = String(body?.fullName || "").trim();
     const password = String(body?.password || "");
+    const bootstrapToken = body?.bootstrapToken ?? request.headers.get("x-bootstrap-token");
     const seedBaseline = Boolean(body?.seedBaseline);
 
-    const user = await createAdminUser({
+    // Concurrency-safe, fail-closed first SUPER_ADMIN provisioning
+    const user = await bootstrapFirstSuperAdmin({
       email,
       fullName,
       password,
-      role: "SUPER_ADMIN",
-      actorId: "initial_bootstrap",
-      actorRole: "SUPER_ADMIN"
+      bootstrapToken,
+      ipAddress: ip
     });
 
     let seedSummary = null;
@@ -56,8 +35,6 @@ export async function POST(request: Request) {
       seedSummary = await seedReviewedBaselineData(user.id);
     }
 
-    const ip = getClientIp(request);
-    const userAgent = request.headers.get("user-agent") || "unknown";
     const { session, rawSessionToken } = await authenticateAdmin({
       email,
       password,
@@ -74,17 +51,52 @@ export async function POST(request: Request) {
         expiresAt: session.expiresAt,
         seedSummary
       },
-      { status: 201 }
+      { status: 201, headers: { "Cache-Control": "no-store" } }
     );
     response.headers.set("Set-Cookie", buildSessionCookieHeader(rawSessionToken));
     return response;
   } catch (error) {
+    const msg = error instanceof Error ? error.message : "Failed to provision initial admin.";
+
+    if (msg.startsWith("BOOTSTRAP_DISABLED:")) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: "BOOTSTRAP_DISABLED",
+          message: msg.replace(/^BOOTSTRAP_DISABLED:\s*/, "")
+        },
+        { status: 503, headers: { "Cache-Control": "no-store" } }
+      );
+    }
+
+    if (msg.startsWith("INVALID_BOOTSTRAP_TOKEN:")) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: "INVALID_BOOTSTRAP_TOKEN",
+          message: msg.replace(/^INVALID_BOOTSTRAP_TOKEN:\s*/, "")
+        },
+        { status: 403, headers: { "Cache-Control": "no-store" } }
+      );
+    }
+
+    if (msg.startsWith("ALREADY_PROVISIONED:")) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: "ALREADY_PROVISIONED",
+          message: msg.replace(/^ALREADY_PROVISIONED:\s*/, "")
+        },
+        { status: 403, headers: { "Cache-Control": "no-store" } }
+      );
+    }
+
     return NextResponse.json(
       {
         success: false,
-        message: error instanceof Error ? error.message : "Failed to provision initial admin."
+        message: msg
       },
-      { status: 400 }
+      { status: 400, headers: { "Cache-Control": "no-store" } }
     );
   }
 }

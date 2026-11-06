@@ -1,17 +1,20 @@
-import { countAdminUsers, createAdminUser, validatePasswordStrength } from "../apps/web/app/lib/auth.ts";
+import { bootstrapFirstSuperAdmin, validatePasswordStrength, verifyBootstrapTokenOrThrow } from "../apps/web/app/lib/auth.ts";
 import { closeDatabaseConnections } from "../apps/web/app/lib/db.ts";
 
 async function main() {
   const email = process.env.ADMIN_EMAIL?.trim().toLowerCase();
   const fullName = process.env.ADMIN_NAME?.trim() || "Principal Administrator";
   const password = process.env.ADMIN_PASSWORD || "";
+  const bootstrapToken = process.env.ADMIN_BOOTSTRAP_TOKEN || "";
 
-  if (!email || !password) {
+  if (!email || !password || !bootstrapToken) {
     console.error(
-      "Usage: ADMIN_EMAIL=admin@estatepilot.in ADMIN_NAME='Principal Admin' ADMIN_PASSWORD='<strong-password>' npm run db:provision-admin"
+      "Usage: ADMIN_BOOTSTRAP_TOKEN='<min-16-char-secret>' ADMIN_EMAIL=admin@estatepilot.in ADMIN_NAME='Principal Admin' ADMIN_PASSWORD='<strong-password>' npm run db:provision-admin"
     );
     process.exit(1);
   }
+
+  verifyBootstrapTokenOrThrow(bootstrapToken);
 
   const strengthError = validatePasswordStrength(password);
   if (strengthError) {
@@ -19,20 +22,12 @@ async function main() {
     process.exit(1);
   }
 
-  const existingCount = await countAdminUsers();
-  if (existingCount > 0) {
-    console.error(
-      `ABORTED: ${existingCount} admin user(s) already exist in estatepilot.admin_users. Use SUPER_ADMIN session to manage additional staff.`
-    );
-    process.exit(1);
-  }
-
-  const user = await createAdminUser({
+  const user = await bootstrapFirstSuperAdmin({
     email,
     fullName,
     password,
-    role: "SUPER_ADMIN",
-    actorId: "cli:provision-first-admin"
+    bootstrapToken,
+    ipAddress: "127.0.0.1"
   });
 
   console.log("Successfully provisioned initial SUPER_ADMIN:", {

@@ -1,5 +1,4 @@
 import { Pool, type PoolClient } from "pg";
-import { PGlite } from "@electric-sql/pglite";
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
@@ -17,12 +16,42 @@ export interface DbClient {
   query<T = QueryResultRow>(sql: string, params?: unknown[]): Promise<DbQueryResult<T>>;
 }
 
-const FORBIDDEN_DB_PATTERNS = [/aurelia/i, /timeflow/i];
-const FORBIDDEN_MASTER_USERS = new Set(["postgres", "rdsadmin", "aurelia_admin", "timeflow_admin"]);
+interface EmbeddedPgLike {
+  exec(sql: string): Promise<unknown>;
+  query<T = QueryResultRow>(
+    sql: string,
+    params?: unknown[]
+  ): Promise<{ rows: T[]; affectedRows?: number }>;
+  transaction<R>(
+    fn: (tx: {
+      query<T = QueryResultRow>(
+        sql: string,
+        params?: unknown[]
+      ): Promise<{ rows: T[]; affectedRows?: number }>;
+    }) => Promise<R>
+  ): Promise<R>;
+  close(): Promise<void>;
+}
+
+const FORBIDDEN_DB_PATTERNS = [/aurelia/i, /timeflow/i, /^postgres$/i, /^template/i];
+const FORBIDDEN_MASTER_USERS = new Set([
+  "postgres",
+  "rdsadmin",
+  "master",
+  "admin",
+  "aurelia_admin",
+  "timeflow_admin"
+]);
+
+export const EXPECTED_MIGRATION_VERSION = "001_estatepilot_schema.sql";
 
 let pgPool: Pool | null = null;
-let pgliteInstance: PGlite | null = null;
-let migrationAppliedPromise: Promise<void> | null = null;
+let pgliteInstance: EmbeddedPgLike | null = null;
+let verifiedSchemaCache: {
+  mode: "rds-postgres" | "dev-pglite";
+  migrationVersion: string;
+  checksum: string;
+} | null = null;
 
 /**
  * Redacts phone numbers, emails, and secrets from log messages to prevent PII leakage.
@@ -47,22 +76,34 @@ function resolveMigrationPath(): string {
   throw new Error("Migration file migrations/001_estatepilot_schema.sql not found.");
 }
 
-function getExternalPool(): Pool {
-  if (pgPool) return pgPool;
-
-  const connectionString = process.env.DATABASE_URL;
-  if (!connectionString) {
-    throw new Error("DATABASE_URL is not configured.");
+/**
+ * Validates that a PostgreSQL connection URL targets the isolated estatepilot_ai database
+ * and does not use a forbidden database (Aurelia TimeFlow / postgres) or RDS master account.
+ * At application runtime (when allowMigratorRole is false), also blocks estatepilot_migrator.
+ */
+export function assertSafeDatabaseUrl(
+  connectionString: string,
+  options: { allowMigratorRole?: boolean } = {}
+): {
+  database: string;
+  username: string;
+  hostname: string;
+} {
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(connectionString);
+  } catch {
+    throw new Error("CRITICAL SAFETY BLOCK: Invalid DATABASE_URL format.");
   }
 
-  const parsedUrl = new URL(connectionString);
   const dbName = parsedUrl.pathname.replace(/^\//, "");
   const dbUser = decodeURIComponent(parsedUrl.username || "");
+  const lowerUser = dbUser.toLowerCase();
 
   for (const pattern of FORBIDDEN_DB_PATTERNS) {
     if (pattern.test(dbName)) {
       throw new Error(
-        `CRITICAL SAFETY BLOCK: Refusing to connect to forbidden database "${dbName}". EstatePilot AI must only connect to isolated database "estatepilot_ai".`
+        `CRITICAL SAFETY BLOCK: Forbidden target database "${dbName}". EstatePilot AI must only connect to isolated database "estatepilot_ai".`
       );
     }
   }
@@ -70,19 +111,71 @@ function getExternalPool(): Pool {
   const expectedDb = process.env.EXPECTED_DB_NAME || "estatepilot_ai";
   if (dbName !== expectedDb) {
     throw new Error(
-      `CRITICAL SAFETY BLOCK: Database name "${dbName}" does not match expected isolated database "${expectedDb}".`
+      `CRITICAL SAFETY BLOCK: Forbidden target database "${dbName}" (expected "${expectedDb}").`
     );
   }
 
-  if (FORBIDDEN_MASTER_USERS.has(dbUser.toLowerCase()) && process.env.ALLOW_MASTER_DB_USER !== "true") {
+  if (FORBIDDEN_MASTER_USERS.has(lowerUser)) {
     throw new Error(
-      `CRITICAL SAFETY BLOCK: Refusing to use master/admin database account "${dbUser}" for application runtime connections. Use "estatepilot_app".`
+      `CRITICAL SAFETY BLOCK: Forbidden master database user "${dbUser}". Use dedicated least-privilege role "estatepilot_app".`
     );
   }
 
+  const allowMigrator = options.allowMigratorRole ?? process.env.ALLOW_SCHEMA_MIGRATION === "true";
+  if (!allowMigrator && lowerUser === "estatepilot_migrator") {
+    throw new Error(
+      `CRITICAL SAFETY BLOCK: Migration role "estatepilot_migrator" is forbidden for application runtime connections. Use "estatepilot_app".`
+    );
+  }
+
+  return {
+    database: dbName,
+    username: dbUser,
+    hostname: parsedUrl.hostname
+  };
+}
+
+export function isUsingExternalPostgres(): boolean {
+  const raw = process.env.DATABASE_URL?.trim();
+  if (!raw) return false;
+  if (
+    process.env.NODE_ENV !== "production" &&
+    process.env.ESTATEPILOT_DEV_SERVER === "true" &&
+    raw === "postgresql://postgres:postgres@localhost:5432/estatepilot"
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Determines whether local non-production PGlite is explicitly permitted.
+ * Strictly returns false in production (NODE_ENV === "production").
+ */
+export function isDevPglitePermitted(): boolean {
+  if (process.env.NODE_ENV === "production") {
+    return false;
+  }
+  if (process.env.ESTATEPILOT_REQUIRE_EXTERNAL_DB === "true") {
+    return false;
+  }
+  return process.env.ALLOW_DEV_PGLITE === "true";
+}
+
+function getExternalPool(options: { allowMigratorRole?: boolean } = {}): Pool {
+  if (pgPool) return pgPool;
+
+  const connectionString = process.env.DATABASE_URL?.trim();
+  if (!connectionString) {
+    throw new Error(
+      "PRODUCTION_DB_REQUIRED: DATABASE_URL is not configured. Configure PostgreSQL connection to isolated database estatepilot_ai."
+    );
+  }
+
+  const parsed = assertSafeDatabaseUrl(connectionString, options);
   const isLocalhost =
-    parsedUrl.hostname === "localhost" ||
-    parsedUrl.hostname === "127.0.0.1" ||
+    (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") &&
+    process.env.NODE_ENV !== "production" &&
     process.env.DB_SSL_MODE === "disable";
 
   pgPool = new Pool({
@@ -94,8 +187,12 @@ function getExternalPool(): Pool {
     ssl: isLocalhost
       ? false
       : {
-          rejectUnauthorized: true,
-          ca: process.env.DB_SSL_CA ? process.env.DB_SSL_CA.replace(/\\n/g, "\n") : undefined
+          rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== "false",
+          ca: process.env.DATABASE_SSL_CA
+            ? process.env.DATABASE_SSL_CA.replace(/\\n/g, "\n")
+            : process.env.DB_SSL_CA
+            ? process.env.DB_SSL_CA.replace(/\\n/g, "\n")
+            : undefined
         }
   });
 
@@ -106,96 +203,190 @@ function getExternalPool(): Pool {
   return pgPool;
 }
 
-async function getEmbeddedPGlite(): Promise<PGlite> {
-  if (process.env.ESTATEPILOT_REQUIRE_EXTERNAL_DB === "true") {
+async function getDevEmbeddedPGlite(): Promise<EmbeddedPgLike> {
+  if (process.env.NODE_ENV === "production") {
     throw new Error(
-      "ESTATEPILOT_REQUIRE_EXTERNAL_DB is enabled, but DATABASE_URL is not configured."
+      "PRODUCTION_DB_REQUIRED: PGlite is strictly forbidden in production (NODE_ENV=production). Configure DATABASE_URL pointing to estatepilot_ai."
+    );
+  }
+  if (!isDevPglitePermitted()) {
+    throw new Error(
+      "PRODUCTION_DB_REQUIRED: DATABASE_URL is not configured and ALLOW_DEV_PGLITE is not enabled. Ephemeral PGlite persistence is disabled."
     );
   }
   if (!pgliteInstance) {
-    pgliteInstance = new PGlite();
+    const pkgName = ["@electric-sql", "pglite"].join("/");
+    const mod = (await import(/* webpackIgnore: true */ pkgName)) as {
+      PGlite: new () => EmbeddedPgLike;
+    };
+    const instance = new mod.PGlite();
+    if (process.env.ESTATEPILOT_DEV_SERVER === "true") {
+      const migrationPath = resolveMigrationPath();
+      const sqlContent = readFileSync(migrationPath, "utf-8");
+      const checksum = createHash("sha256").update(sqlContent).digest("hex");
+      await instance.exec(sqlContent);
+      await instance.query(
+        `INSERT INTO estatepilot.schema_migrations (version, checksum)
+         VALUES ($1, $2)
+         ON CONFLICT (version) DO UPDATE
+           SET checksum = EXCLUDED.checksum,
+               applied_at = NOW()`,
+        [EXPECTED_MIGRATION_VERSION, checksum]
+      );
+    }
+    pgliteInstance = instance;
   }
   return pgliteInstance;
 }
 
-export function isUsingExternalPostgres(): boolean {
-  return Boolean(process.env.DATABASE_URL);
-}
-
 /**
- * Applies migrations/001_estatepilot_schema.sql idempotently and records version checksum.
+ * Executes database schema migrations (migrations/001_estatepilot_schema.sql).
+ * Strictly forbidden during normal application runtime; requires ALLOW_SCHEMA_MIGRATION="true".
  */
-export async function ensureSchemaMigrated(): Promise<{
-  mode: "rds-postgres" | "embedded-postgres";
+export async function runSchemaMigrations(): Promise<{
+  mode: "rds-postgres" | "dev-pglite";
   migrationVersion: string;
   checksum: string;
 }> {
+  if (process.env.ALLOW_SCHEMA_MIGRATION !== "true") {
+    throw new Error(
+      "MIGRATION_FORBIDDEN_AT_RUNTIME: Application runtime is not permitted to execute database schema migrations. Run `ALLOW_SCHEMA_MIGRATION=true npm run db:migrate` using estatepilot_migrator."
+    );
+  }
+
   const migrationPath = resolveMigrationPath();
   const sqlContent = readFileSync(migrationPath, "utf-8");
   const checksum = createHash("sha256").update(sqlContent).digest("hex");
-  const version = "001_estatepilot_schema.sql";
 
-  if (!migrationAppliedPromise) {
-    migrationAppliedPromise = (async () => {
-      try {
-        if (isUsingExternalPostgres()) {
-          const pool = getExternalPool();
-          const client = await pool.connect();
-          try {
-            const dbCheck = await client.query<{ db: string; usr: string }>(
-              "SELECT current_database() AS db, current_user AS usr"
-            );
-            const currentDb = dbCheck.rows[0]?.db || "";
-            if (FORBIDDEN_DB_PATTERNS.some((p) => p.test(currentDb))) {
-              throw new Error(`Safety block: connected database "${currentDb}" is forbidden.`);
-            }
-
-            await client.query(sqlContent);
-            await client.query(
-              `INSERT INTO estatepilot.schema_migrations (version, checksum)
-               VALUES ($1, $2)
-               ON CONFLICT (version) DO UPDATE SET checksum = EXCLUDED.checksum`,
-              [version, checksum]
-            );
-          } finally {
-            client.release();
-          }
-        } else {
-          const pg = await getEmbeddedPGlite();
-          await pg.exec(sqlContent);
-          await pg.query(
-            `INSERT INTO estatepilot.schema_migrations (version, checksum)
-             VALUES ($1, $2)
-             ON CONFLICT (version) DO UPDATE SET checksum = EXCLUDED.checksum`,
-            [version, checksum]
-          );
-        }
-      } catch (err) {
-        migrationAppliedPromise = null;
-        throw err;
+  if (isUsingExternalPostgres()) {
+    const pool = getExternalPool({ allowMigratorRole: true });
+    const client = await pool.connect();
+    try {
+      const dbCheck = await client.query<{ db: string; usr: string }>(
+        "SELECT current_database() AS db, current_user AS usr"
+      );
+      const currentDb = dbCheck.rows[0]?.db || "";
+      if (FORBIDDEN_DB_PATTERNS.some((p) => p.test(currentDb))) {
+        throw new Error(`CRITICAL SAFETY BLOCK: Connected database "${currentDb}" is forbidden.`);
       }
-    })();
+
+      await client.query(sqlContent);
+      await client.query(
+        `INSERT INTO estatepilot.schema_migrations (version, checksum)
+         VALUES ($1, $2)
+         ON CONFLICT (version) DO UPDATE
+           SET checksum = EXCLUDED.checksum,
+               applied_at = NOW(),
+               applied_by = CURRENT_USER`,
+        [EXPECTED_MIGRATION_VERSION, checksum]
+      );
+    } finally {
+      client.release();
+    }
+
+    verifiedSchemaCache = {
+      mode: "rds-postgres",
+      migrationVersion: EXPECTED_MIGRATION_VERSION,
+      checksum
+    };
+    return verifiedSchemaCache;
   }
 
-  await migrationAppliedPromise;
-  return {
-    mode: isUsingExternalPostgres() ? "rds-postgres" : "embedded-postgres",
-    migrationVersion: version,
+  const pg = await getDevEmbeddedPGlite();
+  await pg.exec(sqlContent);
+  await pg.query(
+    `INSERT INTO estatepilot.schema_migrations (version, checksum)
+     VALUES ($1, $2)
+     ON CONFLICT (version) DO UPDATE
+       SET checksum = EXCLUDED.checksum,
+           applied_at = NOW()`,
+    [EXPECTED_MIGRATION_VERSION, checksum]
+  );
+
+  verifiedSchemaCache = {
+    mode: "dev-pglite",
+    migrationVersion: EXPECTED_MIGRATION_VERSION,
     checksum
   };
+  return verifiedSchemaCache;
 }
 
 /**
- * Executes a parameterized SQL query against PostgreSQL.
+ * Read-only runtime verification that the required schema migration has already been applied.
+ * Never executes CREATE/ALTER DDL or INSERTs into schema_migrations.
+ */
+export async function verifySchemaReady(): Promise<{
+  mode: "rds-postgres" | "dev-pglite";
+  migrationVersion: string;
+  checksum: string;
+}> {
+  if (verifiedSchemaCache) {
+    return verifiedSchemaCache;
+  }
+
+  const checkSql = `
+    SELECT version, checksum
+    FROM estatepilot.schema_migrations
+    WHERE version = $1
+    LIMIT 1
+  `;
+
+  try {
+    if (isUsingExternalPostgres()) {
+      const pool = getExternalPool({ allowMigratorRole: false });
+      const res = await pool.query<{ version: string; checksum: string }>(checkSql, [
+        EXPECTED_MIGRATION_VERSION
+      ]);
+      if ((res.rowCount ?? res.rows.length) === 0) {
+        throw new Error(
+          `SCHEMA_NOT_MIGRATED: Required migration "${EXPECTED_MIGRATION_VERSION}" has not been applied to estatepilot_ai.`
+        );
+      }
+      verifiedSchemaCache = {
+        mode: "rds-postgres",
+        migrationVersion: res.rows[0].version,
+        checksum: res.rows[0].checksum
+      };
+      return verifiedSchemaCache;
+    }
+
+    const pg = await getDevEmbeddedPGlite();
+    const res = await pg.query<{ version: string; checksum: string }>(checkSql, [
+      EXPECTED_MIGRATION_VERSION
+    ]);
+    if (res.rows.length === 0) {
+      throw new Error(
+        `SCHEMA_NOT_MIGRATED: Required migration "${EXPECTED_MIGRATION_VERSION}" has not been applied. Run runSchemaMigrations() first.`
+      );
+    }
+    verifiedSchemaCache = {
+      mode: "dev-pglite",
+      migrationVersion: res.rows[0].version,
+      checksum: res.rows[0].checksum
+    };
+    return verifiedSchemaCache;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("does not exist") || msg.includes("SCHEMA_NOT_MIGRATED")) {
+      throw new Error(
+        `SCHEMA_NOT_MIGRATED: Database schema "${EXPECTED_MIGRATION_VERSION}" is not initialized. Application runtime cannot run migrations; run "ALLOW_SCHEMA_MIGRATION=true npm run db:migrate" first.`
+      );
+    }
+    throw err;
+  }
+}
+
+/**
+ * Executes a parameterized SQL query against PostgreSQL after read-only schema verification.
  */
 export async function dbQuery<T = QueryResultRow>(
   sql: string,
   params: unknown[] = []
 ): Promise<DbQueryResult<T>> {
-  await ensureSchemaMigrated();
+  await verifySchemaReady();
 
   if (isUsingExternalPostgres()) {
-    const pool = getExternalPool();
+    const pool = getExternalPool({ allowMigratorRole: false });
     const res = await pool.query(sql, params);
     return {
       rows: res.rows as T[],
@@ -203,7 +394,7 @@ export async function dbQuery<T = QueryResultRow>(
     };
   }
 
-  const pg = await getEmbeddedPGlite();
+  const pg = await getDevEmbeddedPGlite();
   const res = await pg.query<T>(sql, params);
   return {
     rows: res.rows,
@@ -215,10 +406,10 @@ export async function dbQuery<T = QueryResultRow>(
  * Executes a callback inside an atomic PostgreSQL transaction (BEGIN ... COMMIT / ROLLBACK).
  */
 export async function withTransaction<R>(fn: (client: DbClient) => Promise<R>): Promise<R> {
-  await ensureSchemaMigrated();
+  await verifySchemaReady();
 
   if (isUsingExternalPostgres()) {
-    const pool = getExternalPool();
+    const pool = getExternalPool({ allowMigratorRole: false });
     const client: PoolClient = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -242,7 +433,7 @@ export async function withTransaction<R>(fn: (client: DbClient) => Promise<R>): 
     }
   }
 
-  const pg = await getEmbeddedPGlite();
+  const pg = await getDevEmbeddedPGlite();
   return pg.transaction(async (tx) => {
     const wrappedClient: DbClient = {
       async query<T = QueryResultRow>(sql: string, params: unknown[] = []) {
@@ -292,52 +483,11 @@ export async function recordAuditEvent(
 }
 
 /**
- * Validates that a PostgreSQL connection URL targets the isolated estatepilot_ai database
- * and does not use a forbidden database (Aurelia TimeFlow / postgres) or RDS master account.
- */
-export function assertSafeDatabaseUrl(connectionString: string): {
-  database: string;
-  username: string;
-  hostname: string;
-} {
-  const parsedUrl = new URL(connectionString);
-  const dbName = parsedUrl.pathname.replace(/^\//, "");
-  const dbUser = decodeURIComponent(parsedUrl.username || "");
-
-  for (const pattern of FORBIDDEN_DB_PATTERNS) {
-    if (pattern.test(dbName)) {
-      throw new Error(
-        `CRITICAL SAFETY BLOCK: Forbidden target database "${dbName}". EstatePilot AI must only connect to isolated database "estatepilot_ai".`
-      );
-    }
-  }
-
-  const expectedDb = process.env.EXPECTED_DB_NAME || "estatepilot_ai";
-  if (dbName !== expectedDb) {
-    throw new Error(
-      `CRITICAL SAFETY BLOCK: Forbidden target database "${dbName}" (expected "${expectedDb}").`
-    );
-  }
-
-  if (FORBIDDEN_MASTER_USERS.has(dbUser.toLowerCase()) && process.env.ALLOW_MASTER_DB_USER !== "true") {
-    throw new Error(
-      `CRITICAL SAFETY BLOCK: Forbidden master database user "${dbUser}". Use dedicated least-privilege role "estatepilot_app".`
-    );
-  }
-
-  return {
-    database: dbName,
-    username: dbUser,
-    hostname: parsedUrl.hostname
-  };
-}
-
-/**
- * Checks PostgreSQL connectivity, schema migration version, and table counts.
+ * Read-only health check of PostgreSQL connectivity, schema migration version, and table counts.
  */
 export async function checkDatabaseHealth() {
   const startedAt = Date.now();
-  const mig = await ensureSchemaMigrated();
+  const mig = await verifySchemaReady();
   const counts = await dbQuery<{
     properties: number;
     verified_properties: number;
@@ -381,5 +531,5 @@ export async function closeDatabaseConnections(): Promise<void> {
     await pgliteInstance.close().catch(() => {});
     pgliteInstance = null;
   }
-  migrationAppliedPromise = null;
+  verifiedSchemaCache = null;
 }

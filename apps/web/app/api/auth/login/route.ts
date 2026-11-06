@@ -11,22 +11,26 @@ export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
   const ip = getClientIp(request);
-  const rateCheck = checkLoginRateLimit(ip);
-  if (!rateCheck.allowed) {
-    return NextResponse.json(
-      {
-        success: false,
-        code: "RATE_LIMITED",
-        message: `Too many login attempts. Please wait ${rateCheck.retryAfterSeconds} seconds before trying again.`
-      },
-      {
-        status: 429,
-        headers: { "Retry-After": String(rateCheck.retryAfterSeconds) }
-      }
-    );
-  }
 
   try {
+    const rateCheck = await checkLoginRateLimit(ip);
+    if (!rateCheck.allowed) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: "RATE_LIMITED",
+          message: `Too many login attempts. Please wait ${rateCheck.retryAfterSeconds} seconds before trying again.`
+        },
+        {
+          status: 429,
+          headers: {
+            "Retry-After": String(rateCheck.retryAfterSeconds),
+            "Cache-Control": "no-store"
+          }
+        }
+      );
+    }
+
     const body = await request.json();
     const email = String(body?.email || "").trim();
     const password = String(body?.password || "");
@@ -34,7 +38,7 @@ export async function POST(request: Request) {
     if (!email || !password) {
       return NextResponse.json(
         { success: false, message: "Email and password are required." },
-        { status: 400 }
+        { status: 400, headers: { "Cache-Control": "no-store" } }
       );
     }
 
@@ -46,12 +50,15 @@ export async function POST(request: Request) {
       userAgent
     });
 
-    const response = NextResponse.json({
-      success: true,
-      user: session.user,
-      csrfToken: session.csrfToken,
-      expiresAt: session.expiresAt
-    });
+    const response = NextResponse.json(
+      {
+        success: true,
+        user: session.user,
+        csrfToken: session.csrfToken,
+        expiresAt: session.expiresAt
+      },
+      { headers: { "Cache-Control": "no-store" } }
+    );
     response.headers.set("Set-Cookie", buildSessionCookieHeader(rawSessionToken));
     return response;
   } catch (error) {
@@ -59,7 +66,7 @@ export async function POST(request: Request) {
     console.warn("[EstatePilot Auth Login Rejected]:", redactPII(msg));
     return NextResponse.json(
       { success: false, message: msg },
-      { status: 401 }
+      { status: 401, headers: { "Cache-Control": "no-store" } }
     );
   }
 }

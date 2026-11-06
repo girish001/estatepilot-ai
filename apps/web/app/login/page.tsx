@@ -29,6 +29,7 @@ export default function LoginPage() {
   const [setupName, setSetupName] = useState("");
   const [setupEmail, setSetupEmail] = useState("");
   const [setupPassword, setSetupPassword] = useState("");
+  const [setupBootstrapToken, setSetupBootstrapToken] = useState("");
   const [seedBaselineOnSetup, setSeedBaselineOnSetup] = useState(true);
 
   // Create team user state (for SUPER_ADMIN)
@@ -82,11 +83,15 @@ export default function LoginPage() {
     try {
       const res = await fetch("/api/auth/bootstrap", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-bootstrap-token": setupBootstrapToken
+        },
         body: JSON.stringify({
           fullName: setupName,
           email: setupEmail,
-          password: setupPassword
+          password: setupPassword,
+          bootstrapToken: setupBootstrapToken
         })
       });
       const data = await res.json().catch(() => null);
@@ -108,6 +113,7 @@ export default function LoginPage() {
         type: "success",
         message: "Initial SUPER_ADMIN account provisioned and signed in."
       });
+      setSetupBootstrapToken("");
       await refreshSessionAndTeam();
     } catch (err) {
       setFeedback({
@@ -226,7 +232,12 @@ export default function LoginPage() {
   async function handleLogout() {
     setSubmitting(true);
     try {
-      await fetch("/api/auth/logout", { method: "POST" });
+      await fetch("/api/auth/logout", {
+        method: "POST",
+        headers: {
+          "x-csrf-token": csrfToken
+        }
+      });
       setAuthenticatedUser(null);
       setCsrfToken("");
       setFeedback({ type: "success", message: "Signed out of EstatePilot AI." });
@@ -288,10 +299,22 @@ export default function LoginPage() {
               Bootstrap First Production SUPER_ADMIN Account
             </h2>
             <p style={{ fontSize: 13, color: "#475569", marginBottom: 18 }}>
-              No administrator accounts exist yet in <code>estatepilot.admin_users</code>. For security compliance, EstatePilot AI ships with zero default passwords. Create the initial <strong>SUPER_ADMIN</strong> account below.
+              No administrator accounts exist yet in <code>estatepilot.admin_users</code>. For security compliance, EstatePilot AI ships with zero default passwords and requires the server&apos;s secret <code>ADMIN_BOOTSTRAP_TOKEN</code> to provision the initial <strong>SUPER_ADMIN</strong> account.
             </p>
 
             <form onSubmit={handleBootstrapSubmit} style={{ display: "grid", gap: 14, maxWidth: 520 }}>
+              <label style={{ display: "grid", gap: 6, fontSize: 13, fontWeight: 700 }}>
+                Server Bootstrap Token (ADMIN_BOOTSTRAP_TOKEN) *
+                <input
+                  required
+                  type="password"
+                  value={setupBootstrapToken}
+                  onChange={(e) => setSetupBootstrapToken(e.target.value)}
+                  placeholder="Enter secret ADMIN_BOOTSTRAP_TOKEN (>= 16 chars)"
+                  style={{ padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14 }}
+                />
+              </label>
+
               <label style={{ display: "grid", gap: 6, fontSize: 13, fontWeight: 700 }}>
                 Full Name *
                 <input

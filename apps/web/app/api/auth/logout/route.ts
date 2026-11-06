@@ -5,15 +5,28 @@ export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
   try {
-    await revokeSessionByRequest(request);
+    const result = await revokeSessionByRequest(request, { requireCsrf: true });
+    if (result.csrfError) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: "CSRF_INVALID",
+          message: "Invalid or missing CSRF security token (x-csrf-token) for logout."
+        },
+        { status: 403, headers: { "Cache-Control": "no-store" } }
+      );
+    }
   } catch {
-    // Always clear client cookie even if session was already expired
+    // Clear client cookie if session is already expired
   }
 
-  const response = NextResponse.json({
-    success: true,
-    message: "Logged out successfully."
-  });
+  const response = NextResponse.json(
+    {
+      success: true,
+      message: "Logged out successfully."
+    },
+    { headers: { "Cache-Control": "no-store" } }
+  );
   response.headers.set("Set-Cookie", buildClearSessionCookieHeader());
   return response;
 }
