@@ -1,0 +1,184 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PropertyType {
+  PLOT
+  INDEPENDENT_HOUSE
+  FLAT
+  VILLA
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  INTERESTED
+  CALLBACK_SCHEDULED
+  SITE_VISIT_SCHEDULED
+  SITE_VISITED
+  NOT_INTERESTED
+  DO_NOT_CONTACT
+}
+
+enum FollowUpStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  CANCELLED
+  FAILED
+}
+
+enum SiteVisitStatus {
+  REQUESTED
+  CONFIRMED
+  REMINDED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+model Tenant {
+  id        String     @id @default(cuid())
+  name      String
+  slug      String     @unique
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  users     User[]
+  properties Property[]
+  leads     Lead[]
+}
+
+model User {
+  id        String   @id @default(cuid())
+  tenantId  String
+  name      String
+  email     String
+  role      String   @default("ADMIN")
+  createdAt DateTime @default(now())
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+}
+
+model Property {
+  id                    String       @id @default(cuid())
+  tenantId              String
+  name                  String
+  propertyType          PropertyType
+  location              String
+  address               String?
+  areaSqFt              Decimal?     @db.Decimal(12, 2)
+  approvedRatePerSqFt   Decimal      @db.Decimal(14, 2)
+  currency              String       @default("INR")
+  availabilityStatus    String       @default("AVAILABLE")
+  verifiedAt            DateTime?
+  amenities             String[]     @default([])
+  description           String?
+  brochureUrl           String?
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
+  tenant                Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, propertyType, location])
+  @@index([tenantId, availabilityStatus])
+}
+
+model Lead {
+  id                 String       @id @default(cuid())
+  tenantId           String
+  fullName           String
+  phone              String
+  email              String?
+  source             String?
+  preferredLanguage  String?
+  propertyTypes      PropertyType[]
+  preferredLocations String[]     @default([])
+  preferredAreaSqFt  Decimal?     @db.Decimal(12, 2)
+  purchasePurpose    String?
+  purchaseTimeline   String?
+  status             LeadStatus   @default(NEW)
+  nextActionAt       DateTime?
+  lastContactedAt    DateTime?
+  notes              String?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+  tenant             Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  consents            LeadConsent[]
+  calls               Call[]
+  followUps           FollowUp[]
+  siteVisits          SiteVisit[]
+
+  @@index([tenantId, status])
+  @@index([tenantId, phone])
+  @@index([tenantId, nextActionAt])
+}
+
+model LeadConsent {
+  id          String   @id @default(cuid())
+  leadId      String
+  channel     String
+  purpose     String
+  granted     Boolean
+  capturedAt  DateTime @default(now())
+  source      String?
+  evidence    String?
+  lead        Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@index([leadId, channel, granted])
+}
+
+model Call {
+  id              String   @id @default(cuid())
+  leadId          String
+  provider        String
+  providerCallId  String?  @unique
+  direction       String   @default("OUTBOUND")
+  status          String
+  startedAt       DateTime?
+  endedAt         DateTime?
+  language        String?
+  summary         String?
+  transcriptUrl   String?
+  recordingUrl    String?
+  outcome         String?
+  lead            Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@index([leadId, startedAt])
+}
+
+model FollowUp {
+  id             String         @id @default(cuid())
+  leadId         String
+  scheduledAt    DateTime
+  status         FollowUpStatus @default(PENDING)
+  reason         String
+  attemptNumber  Int            @default(1)
+  completedAt    DateTime?
+  outcome        String?
+  createdAt      DateTime       @default(now())
+  lead           Lead           @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@index([status, scheduledAt])
+  @@index([leadId, scheduledAt])
+}
+
+model SiteVisit {
+  id          String          @id @default(cuid())
+  leadId      String
+  propertyId  String?
+  scheduledAt DateTime
+  status      SiteVisitStatus @default(REQUESTED)
+  notes       String?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  lead        Lead            @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@index([scheduledAt, status])
+  @@index([leadId, scheduledAt])
+}
