@@ -38,6 +38,8 @@ async def audio_loop(track,speaker,history,whisper):
   if count<48000: continue
   chunk=np.asarray(frames,dtype=np.float32); frames=[]; count=0
   if np.max(np.abs(chunk))<250: continue
+  # Browser WebRTC audio is commonly 48 kHz; Whisper input is 16 kHz.
+  chunk=np.interp(np.linspace(0,len(chunk)-1,int(len(chunk)/3)),np.arange(len(chunk)),chunk).astype(np.float32)
   with tempfile.NamedTemporaryFile(suffix=".wav",delete=False) as t: path=t.name
   try:
    with wave.open(path,"wb") as w: w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000); w.writeframes(np.clip(chunk,-32768,32767).astype(np.int16).tobytes())
