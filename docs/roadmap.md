@@ -5,12 +5,18 @@
 - [x] Add Next.js dashboard foundation
 - [x] Add Fastify API health endpoint
 - [x] Add initial PostgreSQL Prisma schema (migration generation pending)
+- [x] Choose self-hosted browser-to-browser WebRTC; no PSTN provider
+- [x] Add initial short-lived WebRTC room creation and WebSocket signalling
+- [x] Document self-hosted WebRTC architecture and constraints
+- [ ] Build authenticated receptionist console and customer call page
+- [ ] Add self-hosted coturn and production ICE configuration
+- [ ] Add streaming audio bridge to self-hosted speech-to-text
+- [ ] Add local LLM orchestration and multilingual text-to-speech
 - [ ] Add authentication, roles, and tenant isolation
 - [ ] Add property inventory CRUD and rate verification
 - [ ] Add lead intake API and consent records
 - [ ] Add lead requirement capture and property matching
 - [ ] Add follow-up queue, customer-agreed callbacks, and retry controls
 - [ ] Add site visit scheduling and status lifecycle
-- [ ] Integrate voice provider and AI calling after compliance/provider selection
-- [ ] Add WhatsApp/email notifications and Excel exports
-- [ ] Add audit logs, monitoring, tests, and deployment
+- [ ] Add consent audit, rate limits, abuse protection, monitoring, tests, and deployment
+- [ ] Add WhatsApp/email notifications and Excel exports (optional external delivery integrations)
