@@ -1,7 +1,5 @@
 "use client";
 
-export const dynamic = "force-dynamic";
-
 import { useState, useEffect } from "react";
 import Navbar from "../components/Navbar";
 import { INITIAL_PROPERTIES, PropertyCategory, PropertyRecord } from "../lib/store";
@@ -25,17 +23,29 @@ export default function KnowledgeBasePage() {
     brochureFileName: "Project-Brochure-2026.pdf"
   });
   const [uploadSuccessMsg, setUploadSuccessMsg] = useState("");
+  const [apiErrorMsg, setApiErrorMsg] = useState("");
 
   useEffect(() => {
     let active = true;
     fetch("/api/properties")
-      .then((res) => res.json())
-      .then((data) => {
-        if (active && data?.success && Array.isArray(data.properties) && data.properties.length > 0) {
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.success || !Array.isArray(data.properties)) {
+          throw new Error(data?.message || `Failed to load property inventory (HTTP ${res.status})`);
+        }
+        if (active && data.properties.length > 0) {
           setProperties(data.properties);
         }
       })
-      .catch(() => {});
+      .catch((err) => {
+        if (active) {
+          setApiErrorMsg(
+            err instanceof Error
+              ? `${err.message}. Displaying verified baseline inventory.`
+              : "Could not sync property inventory from server. Displaying verified baseline inventory."
+          );
+        }
+      });
     return () => {
       active = false;
     };
@@ -50,6 +60,7 @@ export default function KnowledgeBasePage() {
     const target = properties.find((p) => p.id === id);
     const nextState = target ? !target.isVerified : false;
     const verifiedBy = nextState ? "Operations Director (Approved)" : "Pending Operational Review";
+    setApiErrorMsg("");
 
     setProperties((prev) =>
       prev.map((p) => {
@@ -69,11 +80,29 @@ export default function KnowledgeBasePage() {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id, isVerified: nextState, verifiedBy })
-    }).catch(() => {});
+    })
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.success) {
+          throw new Error(data?.message || `Failed to update verification status (HTTP ${res.status})`);
+        }
+        setUploadSuccessMsg(
+          `Verification status for "${target?.name || id}" updated to ${nextState ? "Verified & Active" : "Pending Audit"}.`
+        );
+        setTimeout(() => setUploadSuccessMsg(""), 4000);
+      })
+      .catch((err) => {
+        setApiErrorMsg(
+          err instanceof Error
+            ? `Updated locally, but server sync failed: ${err.message}`
+            : "Updated locally, but server sync failed."
+        );
+      });
   }
 
   function handleUploadSubmit(e: React.FormEvent) {
     e.preventDefault();
+    setApiErrorMsg("");
     const newProp: PropertyRecord = {
       id: `prop-${Date.now()}`,
       name: uploadForm.name,
@@ -99,14 +128,31 @@ export default function KnowledgeBasePage() {
     };
 
     setProperties([newProp, ...properties]);
+    setShowUploadModal(false);
+
     fetch("/api/properties", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(newProp)
-    }).catch(() => {});
-    setShowUploadModal(false);
-    setUploadSuccessMsg(`Brochure "${uploadForm.brochureFileName}" uploaded and parsed! Marked as Pending Verification.`);
-    setTimeout(() => setUploadSuccessMsg(""), 5000);
+    })
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.success) {
+          throw new Error(data?.message || `Failed to ingest brochure on server (HTTP ${res.status})`);
+        }
+        if (data.property?.id) {
+          setProperties((prev) => prev.map((p) => (p.id === newProp.id ? data.property : p)));
+        }
+        setUploadSuccessMsg(`Brochure "${uploadForm.brochureFileName}" uploaded and parsed! Marked as Pending Verification.`);
+        setTimeout(() => setUploadSuccessMsg(""), 5000);
+      })
+      .catch((err) => {
+        setApiErrorMsg(
+          err instanceof Error
+            ? `Brochure added to current view, but server persistence failed: ${err.message}`
+            : "Brochure added to current view, but server persistence failed."
+        );
+      });
   }
 
   return (
@@ -134,8 +180,15 @@ export default function KnowledgeBasePage() {
         </div>
 
         {uploadSuccessMsg && (
-          <div style={{ marginTop: 18, padding: 12, background: "#ecfdf5", border: "1px solid #a7f3d0", color: "#047857", borderRadius: 10, fontSize: 13, fontWeight: 700 }}>
+          <div role="status" style={{ marginTop: 18, padding: 12, background: "#ecfdf5", border: "1px solid #a7f3d0", color: "#047857", borderRadius: 10, fontSize: 13, fontWeight: 700 }}>
             ✓ {uploadSuccessMsg}
+          </div>
+        )}
+
+        {apiErrorMsg && (
+          <div role="alert" style={{ marginTop: 18, padding: 12, background: "#fef2f2", border: "1px solid #fecaca", color: "#b91c1c", borderRadius: 10, fontSize: 13, fontWeight: 700, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span>⚠️ {apiErrorMsg}</span>
+            <button type="button" onClick={() => setApiErrorMsg("")} style={{ background: "transparent", border: "none", color: "inherit", cursor: "pointer", fontWeight: 800 }}>✕</button>
           </div>
         )}
 

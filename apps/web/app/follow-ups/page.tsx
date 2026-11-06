@@ -1,7 +1,5 @@
 "use client";
 
-export const dynamic = "force-dynamic";
-
 import { useState } from "react";
 import Navbar from "../components/Navbar";
 import { INITIAL_SITE_VISITS, SiteVisitRecord } from "../lib/store";

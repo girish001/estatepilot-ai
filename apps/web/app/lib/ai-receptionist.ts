@@ -15,25 +15,34 @@ export interface AIResponse {
   };
 }
 
-export function detectLanguage(text: string): SupportedLanguage {
+export function detectExplicitLanguage(text: string): SupportedLanguage | null {
   const lower = text.toLowerCase();
-  
-  // Telugu Unicode range: \u0C00-\u0C7F
-  if (/[\u0C00-\u0C7F]/.test(text) || /\b(namaskaram|andi|meeru|pladlu|illu|chudataniki|eppudu|entha|cheppandi|chudali|taggisi)\b/i.test(lower)) {
+
+  // Telugu Unicode range: \u0C00-\u0C7F or transliterated Telugu tokens
+  if (/[\u0C00-\u0C7F]/.test(text) || /\b(namaskaram|andi|meeru|pladlu|illu|chudataniki|eppudu|entha|cheppandi|chudali|taggisi|phone cheyoddu)\b/i.test(lower)) {
     return "Telugu";
   }
-  
-  // Kannada Unicode range: \u0C80-\u0CFF
+
+  // Kannada Unicode range: \u0C80-\u0CFF or transliterated Kannada tokens
   if (/[\u0C80-\u0CFF]/.test(text) || /\b(namaskara|hegiddira|mane|plotu|bele|jaaga|nodi|yaavaga|nodona|kadime|maadi|madbedi)\b/i.test(lower)) {
     return "Kannada";
   }
-  
-  // Devanagari / Hindi Unicode range: \u0900-\u097F
-  if (/[\u0900-\u097F]/.test(text) || /\b(namaste|kaise|ghar|keemat|bhav|dekhein|shaniwar|ravivar|kya|hai|karo)\b/i.test(lower)) {
+
+  // Devanagari / Hindi Unicode range: \u0900-\u097F or transliterated Hindi tokens
+  if (/[\u0900-\u097F]/.test(text) || /\b(namaste|kaise|ghar|keemat|bhav|dekhein|shaniwar|ravivar|kya|hai|karo|mat karna)\b/i.test(lower)) {
     return "Hindi";
   }
-  
-  return "English";
+
+  // Explicit English conversational phrasing
+  if (/\b(hello|hi|what|where|when|how|which|can|could|would|please|stop|remove|delete|schedule|interested|discount|negotiate|price|rate|details|visit|sunday|saturday|tomorrow|english)\b/i.test(lower)) {
+    return "English";
+  }
+
+  return null;
+}
+
+export function detectLanguage(text: string): SupportedLanguage {
+  return detectExplicitLanguage(text) ?? "English";
 }
 
 export function processCustomerTurn(
@@ -41,8 +50,8 @@ export function processCustomerTurn(
   currentLanguage: SupportedLanguage,
   conversationHistory: Array<{ role: string; text: string }> = []
 ): AIResponse {
-  const detected = detectLanguage(customerMessage);
-  const lang: SupportedLanguage = detected !== "English" ? detected : currentLanguage;
+  const explicitLang = detectExplicitLanguage(customerMessage);
+  const lang: SupportedLanguage = explicitLang ?? currentLanguage;
   const lower = customerMessage.toLowerCase();
 
   // 1. Opt-out check (Rule 8 & 12)

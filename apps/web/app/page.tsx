@@ -1,7 +1,5 @@
 "use client";
 
-export const dynamic = "force-dynamic";
-
 import { useState, useMemo, useEffect } from "react";
 import Navbar from "./components/Navbar";
 import { INITIAL_LEADS, INITIAL_PROPERTIES, LeadRecord, LeadStatus } from "./lib/store";
@@ -13,19 +11,30 @@ export default function DashboardPage() {
   const [categoryFilter, setCategoryFilter] = useState<string>("ALL");
   const [languageFilter, setLanguageFilter] = useState<string>("ALL");
   const [statusFilter, setStatusFilter] = useState<string>("ALL");
+  const [apiFeedback, setApiFeedback] = useState<{ type: "error" | "success"; message: string } | null>(null);
 
   useEffect(() => {
     let active = true;
     fetch("/api/leads")
-      .then((res) => res.json())
-      .then((data) => {
-        if (active && data?.success && Array.isArray(data.leads) && data.leads.length > 0) {
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.success || !Array.isArray(data.leads)) {
+          throw new Error(data?.message || `Failed to load leads (HTTP ${res.status})`);
+        }
+        if (active && data.leads.length > 0) {
           setLeads(data.leads);
           setSelectedLead((prev) => data.leads.find((l: LeadRecord) => l.id === prev?.id) || data.leads[0]);
         }
       })
-      .catch(() => {
-        // Fallback to initial seeded state if offline
+      .catch((err) => {
+        if (active) {
+          setApiFeedback({
+            type: "error",
+            message: err instanceof Error
+              ? `${err.message}. Showing verified baseline lead records.`
+              : "Could not sync live enquiries from server. Showing baseline lead records."
+          });
+        }
       });
     return () => {
       active = false;
@@ -82,11 +91,31 @@ export default function DashboardPage() {
     const updated = { ...selectedLead, status: newStatus, updatedAt: new Date().toISOString() };
     setSelectedLead(updated);
     setLeads((prev) => prev.map((l) => (l.id === updated.id ? updated : l)));
+    setApiFeedback(null);
+
     fetch("/api/leads", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ leadId: updated.id, status: newStatus })
-    }).catch(() => {});
+    })
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.success) {
+          throw new Error(data?.message || `Failed to persist status update (HTTP ${res.status})`);
+        }
+        setApiFeedback({
+          type: "success",
+          message: `Status for ${updated.fullName} (${updated.referenceNumber}) updated to ${newStatus}.`
+        });
+      })
+      .catch((err) => {
+        setApiFeedback({
+          type: "error",
+          message: err instanceof Error
+            ? `Updated in current view, but server sync failed: ${err.message}`
+            : "Updated in current view, but server sync failed."
+        });
+      });
   }
 
   function handleAssignExecutive(name: string) {
@@ -94,11 +123,31 @@ export default function DashboardPage() {
     const updated = { ...selectedLead, assignedExecutive: name, updatedAt: new Date().toISOString() };
     setSelectedLead(updated);
     setLeads((prev) => prev.map((l) => (l.id === updated.id ? updated : l)));
+    setApiFeedback(null);
+
     fetch("/api/leads", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ leadId: updated.id, assignedExecutive: name })
-    }).catch(() => {});
+    })
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.success) {
+          throw new Error(data?.message || `Failed to persist executive assignment (HTTP ${res.status})`);
+        }
+        setApiFeedback({
+          type: "success",
+          message: `Assigned ${name} to ${updated.fullName} (${updated.referenceNumber}).`
+        });
+      })
+      .catch((err) => {
+        setApiFeedback({
+          type: "error",
+          message: err instanceof Error
+            ? `Assigned in current view, but server sync failed: ${err.message}`
+            : "Assigned in current view, but server sync failed."
+        });
+      });
   }
 
   return (
@@ -135,6 +184,35 @@ export default function DashboardPage() {
             </a>
           </div>
         </div>
+
+        {apiFeedback && (
+          <div
+            role="status"
+            style={{
+              marginTop: 16,
+              padding: "12px 16px",
+              borderRadius: 10,
+              fontSize: 13,
+              fontWeight: 600,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              background: apiFeedback.type === "error" ? "#fef2f2" : "#ecfdf5",
+              border: `1px solid ${apiFeedback.type === "error" ? "#fecaca" : "#a7f3d0"}`,
+              color: apiFeedback.type === "error" ? "#b91c1c" : "#047857"
+            }}
+          >
+            <span>{apiFeedback.type === "error" ? `⚠️ ${apiFeedback.message}` : `✓ ${apiFeedback.message}`}</span>
+            <button
+              type="button"
+              onClick={() => setApiFeedback(null)}
+              style={{ background: "transparent", border: "none", color: "inherit", cursor: "pointer", fontWeight: 800, fontSize: 14 }}
+              aria-label="Dismiss notification"
+            >
+              ✕
+            </button>
+          </div>
+        )}
 
         {/* 8 Primary KPI Metric Cards */}
         <div className="metrics-grid">

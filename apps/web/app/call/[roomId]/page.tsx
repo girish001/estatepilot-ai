@@ -1,7 +1,5 @@
 "use client";
 
-export const dynamic = "force-dynamic";
-
 import { useParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import Navbar from "../../components/Navbar";
@@ -149,7 +147,7 @@ export default function CustomerCallPage() {
     if (!text || text.trim().length === 0) return;
 
     const timeStr = new Date().toLocaleTimeString("en-IN", { minute: "2-digit", second: "2-digit" });
-    const userTurn: MessageTurn = { role: humanTakeover ? "customer" : "customer", text, time: timeStr };
+    const userTurn: MessageTurn = { role: "customer", text, time: timeStr };
 
     setTranscript((prev) => [...prev, userTurn]);
     setManualInput("");
@@ -172,28 +170,40 @@ export default function CustomerCallPage() {
         })
       });
 
-      const data = await response.json();
-      if (data.success) {
-        const replyText = data.reply;
-        const newLang: SupportedLanguage = data.detectedLanguage || activeLanguage;
-        if (newLang !== activeLanguage) {
-          setActiveLanguage(newLang);
-        }
-
-        const replyTime = new Date().toLocaleTimeString("en-IN", { minute: "2-digit", second: "2-digit" });
-        const aiTurn: MessageTurn = { role: "receptionist", text: replyText, time: replyTime };
-
-        setTranscript((prev) => [...prev, aiTurn]);
-        setStatusText(data.escalateToHuman ? "Senior Property Executive requested. Connecting to live agent…" : "AI Receptionist responding…");
-
-        if (data.escalateToHuman) {
-          setHumanTakeover(true);
-        }
-
-        speakReply(replyText, newLang);
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.success || typeof data.reply !== "string") {
+        throw new Error(data?.message || `AI Receptionist service error (HTTP ${response.status})`);
       }
+
+      const replyText = data.reply;
+      const newLang: SupportedLanguage = data.detectedLanguage || activeLanguage;
+      if (newLang !== activeLanguage) {
+        setActiveLanguage(newLang);
+      }
+
+      const replyTime = new Date().toLocaleTimeString("en-IN", { minute: "2-digit", second: "2-digit" });
+      const aiTurn: MessageTurn = { role: "receptionist", text: replyText, time: replyTime };
+
+      setTranscript((prev) => [...prev, aiTurn]);
+      setStatusText(data.escalateToHuman ? "Senior Property Executive requested. Connecting to live agent…" : "AI Receptionist responding…");
+
+      if (data.escalateToHuman) {
+        setHumanTakeover(true);
+      }
+
+      speakReply(replyText, newLang);
     } catch (e) {
-      setStatusText("Connection steady. Receptionist listening…");
+      const errMsg = e instanceof Error ? e.message : "Unable to reach AI Receptionist.";
+      setStatusText(`⚠️ ${errMsg}. Please try sending your message again.`);
+      const replyTime = new Date().toLocaleTimeString("en-IN", { minute: "2-digit", second: "2-digit" });
+      setTranscript((prev) => [
+        ...prev,
+        {
+          role: "system",
+          text: `Temporary dialogue service warning: ${errMsg}. Please try again.`,
+          time: replyTime
+        }
+      ]);
     }
   }
 

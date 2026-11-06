@@ -1,7 +1,5 @@
 "use client";
 
-export const dynamic = "force-dynamic";
-
 import { useState } from "react";
 import Navbar from "../components/Navbar";
 import { SupportedLanguage } from "../lib/store";
@@ -12,6 +10,7 @@ export default function ReceptionistControlPage() {
   const [agentLink, setAgentLink] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
   const [copyStatus, setCopyStatus] = useState("");
+  const [errorNotice, setErrorNotice] = useState("");
 
   // Dialogue simulation state
   const [simLang, setSimLang] = useState<SupportedLanguage>("Telugu");
@@ -19,7 +18,7 @@ export default function ReceptionistControlPage() {
   const [simLog, setSimLog] = useState<Array<{ role: string; text: string; time: string }>>([
     {
       role: "AI Receptionist",
-      text: "నమస్కారం! నేను EstatePilot AI రిసెప్షనిస్ట్‌ని. మీకు దేవనహల్లి ప్లాట్లు లేదా వైట్‌ఫీల్డ్ ఫ్లాట్ల వివరాలు కావాలా?",
+      text: "నమస్కారం! నేను EstatePilot AI రిసెప్షనిస్ట్ని. మీకు దేవనహల్లి ప్లాట్లు లేదా వైట్ఫీల్డ్ ఫ్లాట్ల వివరాలు కావాలా?",
       time: "10:00 AM"
     }
   ]);
@@ -28,16 +27,18 @@ export default function ReceptionistControlPage() {
   async function generateRoom() {
     setIsGenerating(true);
     setCopyStatus("");
+    setErrorNotice("");
     try {
       const res = await fetch("/api/webrtc/rooms", { method: "POST" });
-      const data = await res.json();
-      if (data.success) {
-        setCreatedRoomId(data.roomId);
-        setCustomerLink(data.customerUrl);
-        setAgentLink(`/call/${data.roomId}`);
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.success || !data.roomId) {
+        throw new Error(data?.message || `Failed to create WebRTC room (HTTP ${res.status})`);
       }
+      setCreatedRoomId(data.roomId);
+      setCustomerLink(data.customerUrl);
+      setAgentLink(`/call/${data.roomId}`);
     } catch (e) {
-      console.error(e);
+      setErrorNotice(e instanceof Error ? e.message : "Unable to generate WebRTC room link right now.");
     } finally {
       setIsGenerating(false);
     }
@@ -61,6 +62,7 @@ export default function ReceptionistControlPage() {
     setSimLog((prev) => [...prev, { role: "Customer", text: textToSend, time: timeStr }]);
     setSimInput("");
     setIsSimulating(true);
+    setErrorNotice("");
 
     try {
       const res = await fetch("/api/ai/chat", {
@@ -72,16 +74,27 @@ export default function ReceptionistControlPage() {
           history: simLog.map((l) => ({ role: l.role === "AI Receptionist" ? "assistant" : "user", text: l.text }))
         })
       });
-      const data = await res.json();
-      if (data.success) {
-        const replyTime = new Date().toLocaleTimeString("en-IN", { minute: "2-digit", second: "2-digit" });
-        setSimLog((prev) => [...prev, { role: "AI Receptionist", text: data.reply, time: replyTime }]);
-        if (data.detectedLanguage) {
-          setSimLang(data.detectedLanguage);
-        }
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.success || typeof data.reply !== "string") {
+        throw new Error(data?.message || `AI receptionist failed to respond (HTTP ${res.status})`);
+      }
+      const replyTime = new Date().toLocaleTimeString("en-IN", { minute: "2-digit", second: "2-digit" });
+      setSimLog((prev) => [...prev, { role: "AI Receptionist", text: data.reply, time: replyTime }]);
+      if (data.detectedLanguage) {
+        setSimLang(data.detectedLanguage);
       }
     } catch (e) {
-      console.error(e);
+      const msg = e instanceof Error ? e.message : "Unable to reach AI Receptionist engine.";
+      setErrorNotice(msg);
+      const replyTime = new Date().toLocaleTimeString("en-IN", { minute: "2-digit", second: "2-digit" });
+      setSimLog((prev) => [
+        ...prev,
+        {
+          role: "AI Receptionist",
+          text: "⚠️ Temporary connection issue reaching the dialogue service. Please retry your message.",
+          time: replyTime
+        }
+      ]);
     } finally {
       setIsSimulating(false);
     }
@@ -110,6 +123,13 @@ export default function ReceptionistControlPage() {
             <span>{isGenerating ? "Generating Room…" : "🔑 Generate New WebRTC Room Link"}</span>
           </button>
         </div>
+
+        {errorNotice && (
+          <div role="alert" style={{ marginTop: 18, padding: "12px 16px", background: "#fef2f2", border: "1px solid #fecaca", color: "#b91c1c", borderRadius: 10, fontSize: 13, fontWeight: 700, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span>⚠️ {errorNotice}</span>
+            <button type="button" onClick={() => setErrorNotice("")} style={{ background: "transparent", border: "none", color: "inherit", cursor: "pointer", fontWeight: 800 }}>✕</button>
+          </div>
+        )}
 
         {/* Room Link Result Card */}
         {customerLink && (
