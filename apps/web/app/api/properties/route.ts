@@ -19,10 +19,13 @@ export async function GET(request: Request) {
     const page = Number(searchParams.get("page") || 1);
     const pageSize = Number(searchParams.get("pageSize") || 50);
 
-    // Unauthenticated callers only receive verified properties unless an admin session is active
+    // Unauthenticated callers and EXECUTIVE users only receive verified properties;
+    // only SUPER_ADMIN, ADMIN, and MANAGER roles can inspect unverified inventory.
     const session = await getSessionFromRequest(request);
+    const canViewUnverified =
+      session && ["SUPER_ADMIN", "ADMIN", "MANAGER"].includes(session.user.role);
     const verifiedOnlyParam = searchParams.get("verifiedOnly");
-    const verifiedOnly = session ? verifiedOnlyParam === "true" : true;
+    const verifiedOnly = canViewUnverified ? verifiedOnlyParam === "true" : true;
 
     const result = await listPropertiesFromDb({
       category,

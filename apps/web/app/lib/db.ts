@@ -54,13 +54,14 @@ let verifiedSchemaCache: {
 } | null = null;
 
 /**
- * Redacts phone numbers, emails, and secrets from log messages to prevent PII leakage.
+ * Redacts phone numbers, emails, database credentials, and secrets from log messages to prevent PII leakage.
  */
 export function redactPII(input: string): string {
   return input
-    .replace(/(\+?91)?[6-9]\d{9}/g, "+91******REDACTED")
+    .replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "postgresql://[REDACTED_DB_URL]")
+    .replace(/(\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}/g, "+91******REDACTED")
     .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, "[EMAIL_REDACTED]")
-    .replace(/(password|secret|token)=([^\s&]+)/gi, "$1=[REDACTED]");
+    .replace(/(password|secret|token|ep_session|x-csrf-token|x-bootstrap-token)=([^\s&;]+)/gi, "$1=[REDACTED]");
 }
 
 function resolveMigrationPath(): string {
@@ -76,10 +77,24 @@ function resolveMigrationPath(): string {
   throw new Error("Migration file migrations/001_estatepilot_schema.sql not found.");
 }
 
+export function getExpectedMigrationChecksum(): string | null {
+  try {
+    const migrationPath = resolveMigrationPath();
+    const sqlContent = readFileSync(migrationPath, "utf-8");
+    return createHash("sha256").update(sqlContent).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+export function invalidateVerifiedSchemaCache(): void {
+  verifiedSchemaCache = null;
+}
+
 /**
- * Validates that a PostgreSQL connection URL targets the isolated estatepilot_ai database
- * and does not use a forbidden database (Aurelia TimeFlow / postgres) or RDS master account.
- * At application runtime (when allowMigratorRole is false), also blocks estatepilot_migrator.
+ * Validates that a PostgreSQL connection URL targets the isolated estatepilot_ai database,
+ * never connects to Aurelia TimeFlow or master accounts, requires estatepilot_migrator for
+ * migrations, and requires estatepilot_app for application runtime.
  */
 export function assertSafeDatabaseUrl(
   connectionString: string,
@@ -121,17 +136,65 @@ export function assertSafeDatabaseUrl(
     );
   }
 
-  const allowMigrator = options.allowMigratorRole ?? process.env.ALLOW_SCHEMA_MIGRATION === "true";
-  if (!allowMigrator && lowerUser === "estatepilot_migrator") {
-    throw new Error(
-      `CRITICAL SAFETY BLOCK: Migration role "estatepilot_migrator" is forbidden for application runtime connections. Use "estatepilot_app".`
-    );
+  const isMigrationMode = options.allowMigratorRole === true;
+  if (isMigrationMode) {
+    if (lowerUser !== "estatepilot_migrator") {
+      throw new Error(
+        `CRITICAL SAFETY BLOCK: Schema migration execution requires dedicated migration role "estatepilot_migrator" (got "${dbUser}").`
+      );
+    }
+  } else {
+    if (lowerUser === "estatepilot_migrator") {
+      throw new Error(
+        `CRITICAL SAFETY BLOCK: Migration role "estatepilot_migrator" is forbidden for application runtime connections. Use "estatepilot_app".`
+      );
+    }
+    if (lowerUser !== "estatepilot_app") {
+      throw new Error(
+        `CRITICAL SAFETY BLOCK: Application runtime must connect exclusively as least-privilege role "estatepilot_app" (got "${dbUser}").`
+      );
+    }
   }
 
   return {
     database: dbName,
     username: dbUser,
     hostname: parsedUrl.hostname
+  };
+}
+
+/**
+ * Resolves PostgreSQL TLS configuration and prevents disabling certificate verification in production.
+ */
+export function resolveDatabaseSslConfig(hostname: string): false | { rejectUnauthorized: boolean; ca?: string } {
+  const isProd = process.env.NODE_ENV === "production";
+  const rejectUnauthEnv = process.env.DATABASE_SSL_REJECT_UNAUTHORIZED;
+
+  if (isProd && rejectUnauthEnv === "false") {
+    throw new Error(
+      "CRITICAL SAFETY BLOCK: TLS certificate verification (DATABASE_SSL_REJECT_UNAUTHORIZED) cannot be disabled in production."
+    );
+  }
+
+  const ca = process.env.DATABASE_SSL_CA
+    ? process.env.DATABASE_SSL_CA.replace(/\\n/g, "\n")
+    : undefined;
+
+  if (isProd) {
+    return {
+      rejectUnauthorized: true,
+      ...(ca ? { ca } : {})
+    };
+  }
+
+  const isLocalhost = hostname === "localhost" || hostname === "127.0.0.1";
+  if (isLocalhost && rejectUnauthEnv === "false") {
+    return false;
+  }
+
+  return {
+    rejectUnauthorized: rejectUnauthEnv !== "false",
+    ...(ca ? { ca } : {})
   };
 }
 
@@ -163,8 +226,6 @@ export function isDevPglitePermitted(): boolean {
 }
 
 function getExternalPool(options: { allowMigratorRole?: boolean } = {}): Pool {
-  if (pgPool) return pgPool;
-
   const connectionString = process.env.DATABASE_URL?.trim();
   if (!connectionString) {
     throw new Error(
@@ -173,10 +234,9 @@ function getExternalPool(options: { allowMigratorRole?: boolean } = {}): Pool {
   }
 
   const parsed = assertSafeDatabaseUrl(connectionString, options);
-  const isLocalhost =
-    (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") &&
-    process.env.NODE_ENV !== "production" &&
-    process.env.DB_SSL_MODE === "disable";
+  const sslConfig = resolveDatabaseSslConfig(parsed.hostname);
+
+  if (pgPool) return pgPool;
 
   pgPool = new Pool({
     connectionString,
@@ -184,16 +244,7 @@ function getExternalPool(options: { allowMigratorRole?: boolean } = {}): Pool {
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 8_000,
     statement_timeout: 10_000,
-    ssl: isLocalhost
-      ? false
-      : {
-          rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== "false",
-          ca: process.env.DATABASE_SSL_CA
-            ? process.env.DATABASE_SSL_CA.replace(/\\n/g, "\n")
-            : process.env.DB_SSL_CA
-            ? process.env.DB_SSL_CA.replace(/\\n/g, "\n")
-            : undefined
-        }
+    ssl: sslConfig
   });
 
   pgPool.on("error", (err) => {
@@ -331,6 +382,8 @@ export async function verifySchemaReady(): Promise<{
     LIMIT 1
   `;
 
+  const expectedChecksum = getExpectedMigrationChecksum();
+
   try {
     if (isUsingExternalPostgres()) {
       const pool = getExternalPool({ allowMigratorRole: false });
@@ -342,10 +395,16 @@ export async function verifySchemaReady(): Promise<{
           `SCHEMA_NOT_MIGRATED: Required migration "${EXPECTED_MIGRATION_VERSION}" has not been applied to estatepilot_ai.`
         );
       }
+      const row = res.rows[0];
+      if (expectedChecksum && row.checksum !== expectedChecksum) {
+        throw new Error(
+          `SCHEMA_CHECKSUM_MISMATCH: Applied migration "${row.version}" checksum (${row.checksum}) does not match expected checksum (${expectedChecksum}).`
+        );
+      }
       verifiedSchemaCache = {
         mode: "rds-postgres",
-        migrationVersion: res.rows[0].version,
-        checksum: res.rows[0].checksum
+        migrationVersion: row.version,
+        checksum: row.checksum
       };
       return verifiedSchemaCache;
     }
@@ -359,10 +418,16 @@ export async function verifySchemaReady(): Promise<{
         `SCHEMA_NOT_MIGRATED: Required migration "${EXPECTED_MIGRATION_VERSION}" has not been applied. Run runSchemaMigrations() first.`
       );
     }
+    const row = res.rows[0];
+    if (expectedChecksum && row.checksum !== expectedChecksum) {
+      throw new Error(
+        `SCHEMA_CHECKSUM_MISMATCH: Applied migration "${row.version}" checksum (${row.checksum}) does not match expected checksum (${expectedChecksum}).`
+      );
+    }
     verifiedSchemaCache = {
       mode: "dev-pglite",
-      migrationVersion: res.rows[0].version,
-      checksum: res.rows[0].checksum
+      migrationVersion: row.version,
+      checksum: row.checksum
     };
     return verifiedSchemaCache;
   } catch (err) {

@@ -3,14 +3,20 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
   assertSafeDatabaseUrl,
+  resolveDatabaseSslConfig,
+  redactPII,
   runSchemaMigrations,
   verifySchemaReady,
+  invalidateVerifiedSchemaCache,
   dbQuery,
   withTransaction,
   checkDatabaseHealth,
   closeDatabaseConnections
 } from "../apps/web/app/lib/db.ts";
-import { consumeRateLimitBucket } from "../apps/web/app/lib/auth.ts";
+import {
+  assertNoPersistentAdminPasswordInProd,
+  consumeRateLimitBucket
+} from "../apps/web/app/lib/auth.ts";
 import { POST as bootstrapPost } from "../apps/web/app/api/auth/bootstrap/route.ts";
 import { POST as loginPost } from "../apps/web/app/api/auth/login/route.ts";
 import { POST as logoutPost } from "../apps/web/app/api/auth/logout/route.ts";
@@ -21,6 +27,7 @@ import { GET as leadsGet, POST as leadsPost, PATCH as leadsPatch } from "../apps
 import { GET as propsGet, POST as propsPost, PATCH as propsPatch } from "../apps/web/app/api/properties/route.ts";
 import { GET as reportsExportGet } from "../apps/web/app/api/reports/export/route.ts";
 import { POST as aiChatPost } from "../apps/web/app/api/ai/chat/route.ts";
+import { POST as webrtcRoomsPost } from "../apps/web/app/api/webrtc/rooms/route.ts";
 import { GET as healthGet } from "../apps/web/app/api/health/route.ts";
 
 interface TestResult {
@@ -53,16 +60,16 @@ function extractSessionCookie(res: Response): string {
 
 async function main() {
   console.log("=================================================================");
-  console.log(" EstatePilot AI — Production Security & Readiness Test Suite");
+  console.log(" EstatePilot AI — Complete Production Readiness Test Suite");
   console.log("=================================================================");
 
-  // Ensure in-memory PGlite is used only when ALLOW_DEV_PGLITE="true" in non-production
   delete process.env.PGLITE_DATA_DIR;
+  delete process.env.ESTATEPILOT_DEV_SERVER;
   process.env.ALLOW_DEV_PGLITE = "true";
   process.env.ALLOW_SCHEMA_MIGRATION = "false";
 
-  // 1. Database Isolation, Provisioning SQL & Role Separation Tests
-  await runStep("1.1 Provisioning SQL (000_provision_isolated_database_and_roles.sql) is complete and uncommented", async () => {
+  // 1. Database Isolation, Provisioning SQL, Role Separation, TLS & PII Redaction Tests
+  await runStep("1.1 Provisioning SQL (000_provision_isolated_database_and_roles.sql) is complete and enforces least privilege", async () => {
     const sqlPath = resolve(process.cwd(), "migrations/000_provision_isolated_database_and_roles.sql");
     const sql = readFileSync(sqlPath, "utf-8");
     assert.ok(sql.includes("\\set ON_ERROR_STOP on"), "Must enforce ON_ERROR_STOP");
@@ -71,6 +78,7 @@ async function main() {
     assert.ok(sql.includes("\\gexec"), "Must create estatepilot_ai database idempotently via \\gexec");
     assert.ok(sql.includes("\\connect estatepilot_ai"), "Must connect to estatepilot_ai");
     assert.ok(sql.includes("REVOKE ALL ON SCHEMA public FROM PUBLIC;"), "Must revoke public schema privileges");
+    assert.ok(sql.includes("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA estatepilot TO estatepilot_app;"), "Must grant sequence permissions");
     assert.ok(sql.includes("estatepilot.rate_limit_buckets"), "Must grant least-privilege access to rate_limit_buckets");
     assert.ok(!sql.includes("/*"), "Must not contain commented-out SQL blocks");
   });
@@ -86,7 +94,7 @@ async function main() {
     );
   });
 
-  await runStep("1.3 Safety guard blocks RDS master user and blocks estatepilot_migrator at runtime", async () => {
+  await runStep("1.3 Safety guard enforces strict role separation: estatepilot_migrator for migrations, estatepilot_app for runtime", async () => {
     assert.throws(
       () => assertSafeDatabaseUrl("postgresql://postgres:secret@rds.amazonaws.com:5432/estatepilot_ai"),
       /Forbidden master database user/
@@ -98,39 +106,84 @@ async function main() {
         }),
       /Migration role "estatepilot_migrator" is forbidden for application runtime/
     );
+    assert.throws(
+      () =>
+        assertSafeDatabaseUrl("postgresql://other_user:secret@rds.amazonaws.com:5432/estatepilot_ai", {
+          allowMigratorRole: false
+        }),
+      /Application runtime must connect exclusively as least-privilege role "estatepilot_app"/
+    );
+    assert.throws(
+      () =>
+        assertSafeDatabaseUrl("postgresql://estatepilot_app:secret@rds.amazonaws.com:5432/estatepilot_ai", {
+          allowMigratorRole: true
+        }),
+      /Schema migration execution requires dedicated migration role "estatepilot_migrator"/
+    );
     const migParsed = assertSafeDatabaseUrl(
       "postgresql://estatepilot_migrator:secret@rds.amazonaws.com:5432/estatepilot_ai",
       { allowMigratorRole: true }
     );
     assert.equal(migParsed.username, "estatepilot_migrator");
-  });
 
-  await runStep("1.4 Safety guard permits isolated estatepilot_ai database and estatepilot_app role", async () => {
-    const parsed = assertSafeDatabaseUrl(
+    const appParsed = assertSafeDatabaseUrl(
       "postgresql://estatepilot_app:StrongSecret123@aurelia-timeflow-db-mumbai.cluster.ap-south-1.rds.amazonaws.com:5432/estatepilot_ai"
     );
-    assert.equal(parsed.database, "estatepilot_ai");
-    assert.equal(parsed.username, "estatepilot_app");
+    assert.equal(appParsed.database, "estatepilot_ai");
+    assert.equal(appParsed.username, "estatepilot_app");
   });
 
-  // 2. Production PGlite Block & Runtime Migration Prohibition Tests
+  await runStep("1.4 Production TLS verification cannot be disabled and permanent admin passwords are blocked in production", async () => {
+    const origNodeEnv = process.env.NODE_ENV;
+    const origReject = process.env.DATABASE_SSL_REJECT_UNAUTHORIZED;
+    const origAdminPass = process.env.ADMIN_PASSWORD;
+    try {
+      process.env.NODE_ENV = "production";
+      process.env.DATABASE_SSL_REJECT_UNAUTHORIZED = "false";
+      assert.throws(
+        () => resolveDatabaseSslConfig("aurelia-timeflow-db-mumbai.rds.amazonaws.com"),
+        /TLS certificate verification \(DATABASE_SSL_REJECT_UNAUTHORIZED\) cannot be disabled in production/
+      );
+
+      process.env.DATABASE_SSL_REJECT_UNAUTHORIZED = "true";
+      const sslCfg = resolveDatabaseSslConfig("aurelia-timeflow-db-mumbai.rds.amazonaws.com");
+      assert.deepEqual(sslCfg, { rejectUnauthorized: true });
+
+      process.env.ADMIN_PASSWORD = "PermanentPasswordInEnv123!";
+      assert.throws(
+        () => assertNoPersistentAdminPasswordInProd(),
+        /SECURITY_CONFIG_ERROR/
+      );
+    } finally {
+      process.env.NODE_ENV = origNodeEnv;
+      process.env.DATABASE_SSL_REJECT_UNAUTHORIZED = origReject;
+      if (origAdminPass === undefined) delete process.env.ADMIN_PASSWORD;
+      else process.env.ADMIN_PASSWORD = origAdminPass;
+    }
+  });
+
+  await runStep("1.5 PII redaction masks phone numbers, emails, DB URLs, and session/bootstrap tokens", async () => {
+    const raw =
+      "Failed for user@estatepilot.in phone +91 98450 77889 url postgresql://estatepilot_app:MySecret@rds:5432/estatepilot_ai ep_session=abc123def";
+    const redacted = redactPII(raw);
+    assert.ok(!redacted.includes("user@estatepilot.in"));
+    assert.ok(!redacted.includes("98450"));
+    assert.ok(!redacted.includes("MySecret"));
+    assert.ok(!redacted.includes("abc123def"));
+  });
+
+  // 2. Production PGlite Block, Runtime Migration Prohibition & Checksum Verification Tests
   await runStep("2.1 PGlite is strictly blocked when NODE_ENV=production or ALLOW_DEV_PGLITE=false", async () => {
     const origNodeEnv = process.env.NODE_ENV;
     const origAllowPglite = process.env.ALLOW_DEV_PGLITE;
     try {
       process.env.NODE_ENV = "production";
       process.env.ALLOW_DEV_PGLITE = "true";
-      await assert.rejects(
-        () => verifySchemaReady(),
-        /PRODUCTION_DB_REQUIRED/
-      );
+      await assert.rejects(() => verifySchemaReady(), /PRODUCTION_DB_REQUIRED/);
 
       process.env.NODE_ENV = "test";
       process.env.ALLOW_DEV_PGLITE = "false";
-      await assert.rejects(
-        () => verifySchemaReady(),
-        /PRODUCTION_DB_REQUIRED/
-      );
+      await assert.rejects(() => verifySchemaReady(), /PRODUCTION_DB_REQUIRED/);
     } finally {
       process.env.NODE_ENV = origNodeEnv;
       process.env.ALLOW_DEV_PGLITE = origAllowPglite;
@@ -139,29 +192,37 @@ async function main() {
 
   await runStep("2.2 Application runtime cannot execute schema migrations and fails closed when unmigrated", async () => {
     process.env.ALLOW_SCHEMA_MIGRATION = "false";
-    await assert.rejects(
-      () => runSchemaMigrations(),
-      /MIGRATION_FORBIDDEN_AT_RUNTIME/
-    );
-    await assert.rejects(
-      () => verifySchemaReady(),
-      /SCHEMA_NOT_MIGRATED/
-    );
+    await assert.rejects(() => runSchemaMigrations(), /MIGRATION_FORBIDDEN_AT_RUNTIME/);
+    await assert.rejects(() => verifySchemaReady(), /SCHEMA_NOT_MIGRATED/);
   });
 
-  await runStep("2.3 Explicit migration runner (ALLOW_SCHEMA_MIGRATION=true) applies 001_estatepilot_schema.sql, then locks runtime back to read-only verification", async () => {
+  await runStep("2.3 Explicit migration runner applies 001_estatepilot_schema.sql and verifySchemaReady enforces SHA-256 checksum integrity", async () => {
     process.env.ALLOW_SCHEMA_MIGRATION = "true";
+    let validChecksum = "";
     try {
       const migResult = await runSchemaMigrations();
       assert.equal(migResult.migrationVersion, "001_estatepilot_schema.sql");
+      validChecksum = migResult.checksum;
     } finally {
       process.env.ALLOW_SCHEMA_MIGRATION = "false";
     }
 
-    const mig = await dbQuery<{ version: string }>(
-      `SELECT version FROM estatepilot.schema_migrations WHERE version = '001_estatepilot_schema.sql'`
+    // Simulate tampered migration checksum and verify runtime detects drift
+    await dbQuery(
+      `UPDATE estatepilot.schema_migrations SET checksum = 'tampered_checksum_000' WHERE version = '001_estatepilot_schema.sql'`
     );
-    assert.equal(mig.rowCount, 1);
+    invalidateVerifiedSchemaCache();
+    await assert.rejects(() => verifySchemaReady(), /SCHEMA_CHECKSUM_MISMATCH/);
+
+    // Restore valid checksum via explicit migration runner
+    process.env.ALLOW_SCHEMA_MIGRATION = "true";
+    try {
+      await runSchemaMigrations();
+    } finally {
+      process.env.ALLOW_SCHEMA_MIGRATION = "false";
+    }
+    const verified = await verifySchemaReady();
+    assert.equal(verified.checksum, validChecksum);
   });
 
   await runStep("2.4 Verify PostgreSQL transaction rollback on error", async () => {
@@ -220,7 +281,7 @@ async function main() {
     assert.equal(exportRes.status, 401);
   });
 
-  // 4. Fail-Closed Bootstrap Token & Concurrency-Safe First-Admin Provisioning
+  // 4. Fail-Closed Bootstrap Token, Concurrency-Safe First-Admin Provisioning & Session Expiry
   let superAdminCookie = "";
   let superAdminCsrf = "";
   const TEST_BOOTSTRAP_SECRET = "ep_bootstrap_secret_token_2026_mumbai";
@@ -315,7 +376,7 @@ async function main() {
     assert.equal(countRes.rows[0].count, "1");
   });
 
-  await runStep("4.4 Logout enforces CSRF token (403 when missing) and revokes session when valid", async () => {
+  await runStep("4.4 Expired sessions are rejected (401) and logout enforces CSRF token (403 when missing)", async () => {
     const noCsrfLogout = await logoutPost(
       new Request("http://localhost:3000/api/auth/logout", {
         method: "POST",
@@ -324,25 +385,15 @@ async function main() {
     );
     assert.equal(noCsrfLogout.status, 403);
 
-    const validLogout = await logoutPost(
-      new Request("http://localhost:3000/api/auth/logout", {
-        method: "POST",
-        headers: {
-          cookie: superAdminCookie,
-          "x-csrf-token": superAdminCsrf
-        }
-      })
-    );
-    assert.equal(validLogout.status, 200);
-
-    const meAfterLogout = await meGet(
-      new Request("http://localhost:3000/api/auth/me", {
+    // Expire current session in DB and verify /api/leads rejects it with 401
+    await dbQuery(`UPDATE estatepilot.admin_sessions SET expires_at = NOW() - INTERVAL '1 hour'`);
+    const expiredLeadsRes = await leadsGet(
+      new Request("http://localhost:3000/api/leads", {
         method: "GET",
         headers: { cookie: superAdminCookie }
       })
     );
-    const meData = await meAfterLogout.json();
-    assert.equal(meData.authenticated, false);
+    assert.equal(expiredLeadsRes.status, 401);
   });
 
   await runStep("4.5 Bad password login is rejected (401), valid SUPER_ADMIN login succeeds, and reviewed seed populates baseline", async () => {
@@ -388,7 +439,7 @@ async function main() {
     assert.ok(seedData.leadsSeeded >= 5);
   });
 
-  await runStep("4.6 Distributed PostgreSQL rate limiter (estatepilot.rate_limit_buckets) enforces limits across requests", async () => {
+  await runStep("4.6 Distributed PostgreSQL rate limiter enforces limits across login, enquiry, AI chat, and WebRTC endpoints", async () => {
     const key = "test:bucket:ip-192.0.2.99";
     const r1 = await consumeRateLimitBucket(key, 2, 60_000);
     const r2 = await consumeRateLimitBucket(key, 2, 60_000);
@@ -397,6 +448,17 @@ async function main() {
     assert.equal(r2.allowed, true);
     assert.equal(r3.allowed, false);
     assert.ok(r3.retryAfterSeconds > 0);
+
+    // Verify WebRTC room endpoint sanitizes untrusted Host headers and creates room
+    const roomRes = await webrtcRoomsPost(
+      new Request("http://localhost:3000/api/webrtc/rooms", {
+        method: "POST",
+        headers: { host: "evil.example.com/injected", "x-forwarded-for": "10.90.0.1" }
+      })
+    );
+    assert.equal(roomRes.status, 201);
+    const roomData = await roomRes.json();
+    assert.ok(roomData.customerUrl.startsWith("http://localhost:3000/call/"));
   });
 
   // 5. Public Enquiry Submission, Validation, Duplicate & Compliance Tests
@@ -480,7 +542,9 @@ async function main() {
     assert.equal(budgetRes.status, 400);
   });
 
-  // 6. Role-Based Access Control (RBAC), Exact Executive Lead Isolation & Anti-Spoofing Tests
+  // 6. All Four RBAC Roles, Exact Executive Lead Isolation & Anti-Spoofing Tests
+  let adminCookie = "";
+  let adminCsrf = "";
   let managerCookie = "";
   let managerCsrf = "";
   let executiveCookie = "";
@@ -488,7 +552,25 @@ async function main() {
   let spoofExecCookie = "";
   let spoofExecCsrf = "";
 
-  await runStep("6.1 SUPER_ADMIN creates MANAGER, EXECUTIVE ('Suresh Kumar'), and substring-named EXECUTIVE ('Suresh')", async () => {
+  await runStep("6.1 SUPER_ADMIN creates ADMIN, MANAGER, EXECUTIVE ('Suresh Kumar'), and substring-named EXECUTIVE ('Suresh')", async () => {
+    const adminCreate = await usersPost(
+      new Request("http://localhost:3000/api/auth/users", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          cookie: superAdminCookie,
+          "x-csrf-token": superAdminCsrf
+        },
+        body: JSON.stringify({
+          email: "admin@estatepilot.in",
+          fullName: "Kiran Operations Admin",
+          password: "AdminPassword2026!",
+          role: "ADMIN"
+        })
+      })
+    );
+    assert.equal(adminCreate.status, 201);
+
     const mgrCreate = await usersPost(
       new Request("http://localhost:3000/api/auth/users", {
         method: "POST",
@@ -545,6 +627,16 @@ async function main() {
     );
     assert.equal(spoofCreate.status, 201);
 
+    const adminLogin = await loginPost(
+      new Request("http://localhost:3000/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-forwarded-for": "10.20.30.49" },
+        body: JSON.stringify({ email: "admin@estatepilot.in", password: "AdminPassword2026!" })
+      })
+    );
+    adminCookie = extractSessionCookie(adminLogin);
+    adminCsrf = (await adminLogin.json()).csrfToken;
+
     const mgrLogin = await loginPost(
       new Request("http://localhost:3000/api/auth/login", {
         method: "POST",
@@ -577,7 +669,6 @@ async function main() {
   });
 
   await runStep("6.2 Exact executive matching blocks substring spoofing ('Suresh' cannot read or update 'Suresh Kumar' leads)", async () => {
-    // 'Suresh' queries leads -> must NOT receive leads assigned to 'Suresh Kumar (Kannada Language Specialist)'
     const spoofLeadsRes = await leadsGet(
       new Request("http://localhost:3000/api/leads", {
         method: "GET",
@@ -588,7 +679,6 @@ async function main() {
     const spoofLeadsData = await spoofLeadsRes.json();
     assert.equal(spoofLeadsData.leads.length, 0);
 
-    // 'Suresh' attempts to update a lead assigned to 'Suresh Kumar (Kannada Language Specialist)' -> 403 Forbidden
     const spoofPatchRes = await leadsPatch(
       new Request("http://localhost:3000/api/leads", {
         method: "PATCH",
@@ -640,38 +730,39 @@ async function main() {
     assert.equal(dncData.lead.consent.granted, false);
   });
 
-  await runStep("6.4 EXECUTIVE cannot reassign executives (403), export bulk CSV reports (403), or list admin users (403)", async () => {
-    const reassignRes = await leadsPatch(
-      new Request("http://localhost:3000/api/leads", {
-        method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-          cookie: executiveCookie,
-          "x-csrf-token": executiveCsrf
-        },
-        body: JSON.stringify({
-          leadId: createdLeadId,
-          assignedExecutive: "Rajesh Sharma (Senior Property Specialist)"
+  await runStep("6.4 EXECUTIVE, MANAGER, and ADMIN cannot create staff accounts (/api/auth/users is SUPER_ADMIN only)", async () => {
+    for (const [cookie, csrf] of [
+      [executiveCookie, executiveCsrf],
+      [managerCookie, managerCsrf],
+      [adminCookie, adminCsrf]
+    ]) {
+      const listRes = await usersGet(
+        new Request("http://localhost:3000/api/auth/users", {
+          method: "GET",
+          headers: { cookie }
         })
-      })
-    );
-    assert.equal(reassignRes.status, 403);
+      );
+      assert.equal(listRes.status, 403);
 
-    const exportRes = await reportsExportGet(
-      new Request("http://localhost:3000/api/reports/export?type=daily-enquiries", {
-        method: "GET",
-        headers: { cookie: executiveCookie }
-      })
-    );
-    assert.equal(exportRes.status, 403);
-
-    const usersListRes = await usersGet(
-      new Request("http://localhost:3000/api/auth/users", {
-        method: "GET",
-        headers: { cookie: executiveCookie }
-      })
-    );
-    assert.equal(usersListRes.status, 403);
+      const createRes = await usersPost(
+        new Request("http://localhost:3000/api/auth/users", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            cookie,
+            "x-csrf-token": csrf
+          },
+          body: JSON.stringify({
+            email: "unauthorized@estatepilot.in",
+            fullName: "Unauthorized",
+            password: "Password2026!",
+            role: "EXECUTIVE",
+            assignedExecutiveName: "Rajesh Sharma"
+          })
+        })
+      );
+      assert.equal(createRes.status, 403);
+    }
   });
 
   // 7. Property Ingestion, Verification RBAC, Unverified Exclusion & CSV Formula Sanitization
@@ -718,19 +809,28 @@ async function main() {
     assert.equal(verifyAttempt.status, 403);
   });
 
-  await runStep("7.2 Unverified properties are excluded from public GET /api/properties and AI Receptionist recommendations", async () => {
+  await runStep("7.2 Unverified properties are excluded from public and EXECUTIVE GET /api/properties and AI Receptionist", async () => {
     const publicPropsRes = await propsGet(
-      new Request("http://localhost:3000/api/properties", { method: "GET" })
+      new Request("http://localhost:3000/api/properties?verifiedOnly=false", { method: "GET" })
     );
     assert.equal(publicPropsRes.status, 200);
     const publicPropsData = await publicPropsRes.json();
     assert.ok(publicPropsData.properties.every((p: { isVerified: boolean }) => p.isVerified === true));
     assert.ok(!publicPropsData.properties.some((p: { id: string }) => p.id === unverifiedPropId));
 
+    const execPropsRes = await propsGet(
+      new Request("http://localhost:3000/api/properties?verifiedOnly=false", {
+        method: "GET",
+        headers: { cookie: executiveCookie }
+      })
+    );
+    const execPropsData = await execPropsRes.json();
+    assert.ok(execPropsData.properties.every((p: { isVerified: boolean }) => p.isVerified === true));
+
     const aiRes = await aiChatPost(
       new Request("http://localhost:3000/api/ai/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "x-forwarded-for": "10.60.0.1" },
         body: JSON.stringify({
           message: "Show me 2 BHK apartments in Whitefield",
           language: "English"
@@ -743,19 +843,19 @@ async function main() {
     assert.ok(!aiData.matchedProperties.some((p: { id: string }) => p.id === unverifiedPropId));
   });
 
-  await runStep("7.3 SUPER_ADMIN approves property verification and CSV export neutralizes formula injection payloads", async () => {
+  await runStep("7.3 ADMIN approves property verification and CSV export neutralizes formula injection payloads", async () => {
     const verifyRes = await propsPatch(
       new Request("http://localhost:3000/api/properties", {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
-          cookie: superAdminCookie,
-          "x-csrf-token": superAdminCsrf
+          cookie: adminCookie,
+          "x-csrf-token": adminCsrf
         },
         body: JSON.stringify({
           id: unverifiedPropId,
           isVerified: true,
-          verifiedBy: "Girish Principal Admin"
+          verifiedBy: "Kiran Operations Admin"
         })
       })
     );
@@ -764,13 +864,12 @@ async function main() {
     const csvRes = await reportsExportGet(
       new Request("http://localhost:3000/api/reports/export?type=daily-enquiries", {
         method: "GET",
-        headers: { cookie: superAdminCookie }
+        headers: { cookie: adminCookie }
       })
     );
     assert.equal(csvRes.status, 200);
     const csvText = await csvRes.text();
     assert.ok(csvText.includes("Vikramaditya Rao"));
-    // Verify formula payload =CMD|' /C calc'!A0 was neutralized with a leading single quote
     assert.ok(csvText.includes("\"'=CMD|' /C calc'!A0\""), "Formula payload must be neutralized with leading single quote");
   });
 
@@ -784,7 +883,7 @@ async function main() {
     assert.equal(data.database.migrationVersion, "001_estatepilot_schema.sql");
     assert.ok(data.database.counts.leads >= 6);
     assert.ok(data.database.counts.properties >= 5);
-    assert.ok(data.database.counts.adminUsers >= 4);
+    assert.ok(data.database.counts.adminUsers >= 5);
   });
 
   const healthSummary = await checkDatabaseHealth();

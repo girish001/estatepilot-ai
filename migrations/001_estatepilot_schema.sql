@@ -195,12 +195,25 @@ CREATE INDEX IF NOT EXISTS estatepilot_audit_occurred_idx
   ON estatepilot.audit_events (occurred_at DESC);
 
 -- 10. Grant least-privilege runtime permissions if estatepilot_app role exists
+REVOKE ALL ON ALL TABLES IN SCHEMA estatepilot FROM PUBLIC;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA estatepilot FROM PUBLIC;
+
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'estatepilot_app') THEN
     GRANT USAGE ON SCHEMA estatepilot TO estatepilot_app;
+
     REVOKE ALL ON TABLE estatepilot.schema_migrations FROM estatepilot_app;
     GRANT SELECT ON TABLE estatepilot.schema_migrations TO estatepilot_app;
+
+    REVOKE ALL ON TABLE
+      estatepilot.properties,
+      estatepilot.leads,
+      estatepilot.site_visits,
+      estatepilot.calls,
+      estatepilot.admin_users,
+      estatepilot.admin_sessions
+    FROM estatepilot_app;
 
     GRANT SELECT, INSERT, UPDATE ON TABLE
       estatepilot.properties,
@@ -211,12 +224,15 @@ BEGIN
       estatepilot.admin_sessions
     TO estatepilot_app;
 
+    REVOKE ALL ON TABLE estatepilot.rate_limit_buckets FROM estatepilot_app;
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
       estatepilot.rate_limit_buckets
     TO estatepilot_app;
 
     REVOKE ALL ON TABLE estatepilot.audit_events FROM estatepilot_app;
     GRANT SELECT, INSERT ON TABLE estatepilot.audit_events TO estatepilot_app;
+
+    REVOKE ALL ON ALL SEQUENCES IN SCHEMA estatepilot FROM estatepilot_app;
     GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA estatepilot TO estatepilot_app;
   END IF;
 END

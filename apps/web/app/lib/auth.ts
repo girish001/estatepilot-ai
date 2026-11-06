@@ -116,8 +116,36 @@ export async function checkPublicEnquiryRateLimit(ip: string): Promise<{
   return consumeRateLimitBucket(`enquiry_ip:${ip}`, 15, 10 * 60 * 1000);
 }
 
+export async function checkAiChatRateLimit(ip: string): Promise<{
+  allowed: boolean;
+  retryAfterSeconds: number;
+}> {
+  return consumeRateLimitBucket(`aichat_ip:${ip}`, 30, 5 * 60 * 1000);
+}
+
+export async function checkWebrtcRoomRateLimit(ip: string): Promise<{
+  allowed: boolean;
+  retryAfterSeconds: number;
+}> {
+  return consumeRateLimitBucket(`webrtc_ip:${ip}`, 15, 10 * 60 * 1000);
+}
+
 export async function resetRateLimitsForTests(): Promise<void> {
   await dbQuery("DELETE FROM estatepilot.rate_limit_buckets").catch(() => {});
+}
+
+export function assertNoPersistentAdminPasswordInProd(): void {
+  if (process.env.NODE_ENV === "production") {
+    if (
+      process.env.ADMIN_PASSWORD?.trim() ||
+      process.env.NEXT_PUBLIC_ADMIN_PASSWORD?.trim() ||
+      process.env.NEXT_PUBLIC_ADMIN_BOOTSTRAP_TOKEN?.trim()
+    ) {
+      throw new Error(
+        "SECURITY_CONFIG_ERROR: Permanent admin passwords or NEXT_PUBLIC_ bootstrap secrets must never be stored in production runtime environment configuration."
+      );
+    }
+  }
 }
 
 export function validatePasswordStrength(password: string): string | null {
@@ -201,6 +229,7 @@ export const countAdminUsers = getAdminUserCount;
  * If ADMIN_BOOTSTRAP_TOKEN is not configured or shorter than 16 chars, bootstrap is disabled.
  */
 export function verifyBootstrapTokenOrThrow(providedToken: unknown): void {
+  assertNoPersistentAdminPasswordInProd();
   const configuredToken = process.env.ADMIN_BOOTSTRAP_TOKEN?.trim() || "";
   if (configuredToken.length < 16) {
     throw new Error(
