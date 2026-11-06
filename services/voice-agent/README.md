@@ -16,6 +16,35 @@ Joins an EstatePilot WebRTC room as an AI participant. Audio is processed locall
   ```
 - Customer opens the generated URL and selects Join call.
 
+
+## Language support: English, Kannada, Telugu and Hindi
+
+The agent detects the language from each Whisper transcription and instructs Ollama to answer in that language. It can switch language when the customer switches. Use a multilingual Whisper model (the default `small` model is multilingual) and a multilingual Ollama model; the default is now `qwen2.5:3b`. Pull it with:
+
+```bash
+ollama pull qwen2.5:3b
+```
+
+Speech output requires a separate compatible Piper voice model for every language. Configure the ONNX voice paths using these environment variables:
+
+- `PIPER_VOICE_EN` — English voice
+- `PIPER_VOICE_KN` — Kannada voice
+- `PIPER_VOICE_TE` — Telugu voice
+- `PIPER_VOICE_HI` — Hindi voice
+
+Example PowerShell configuration:
+
+```powershell
+$env:PIPER_VOICE_EN="voices/<english-voice>.onnx"
+$env:PIPER_VOICE_KN="voices/<kannada-voice>.onnx"
+$env:PIPER_VOICE_TE="voices/<telugu-voice>.onnx"
+$env:PIPER_VOICE_HI="voices/<hindi-voice>.onnx"
+```
+
+Use real voice files and their matching Piper configuration files; the placeholders above are not downloadable model names. Confirm each voice actually speaks the target language, review its licence for commercial use, and test pronunciation with native speakers. Piper voice availability and quality differ by language. If Kannada or Telugu voice models are not available for your selected TTS engine, the agent cannot speak those languages aloud until a compatible local voice engine/model is installed. Do not configure an English voice as a fallback for an Indian-language response.
+
+Whisper language detection is automatic; very short utterances or mixed-language speech can be misdetected. Test all four languages and code-switching with real speakers before customer use.
+
 ## Environment
 `ESTATEPILOT_SIGNAL_URL` (default ws://localhost:4000), required `ESTATEPILOT_ROOM_ID`, `OLLAMA_URL` (default http://localhost:11434), `OLLAMA_MODEL` (llama3.2:3b), `WHISPER_MODEL` (small), `WHISPER_DEVICE` (cpu), `WHISPER_COMPUTE_TYPE` (int8), `PIPER_BIN` (piper), `PIPER_VOICE` (voices/en_US-lessac-medium.onnx).
 
