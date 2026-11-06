@@ -8,6 +8,7 @@ import {
   runSchemaMigrations,
   verifySchemaReady,
   invalidateVerifiedSchemaCache,
+  setDatabaseFaultInjectionForTests,
   dbQuery,
   withTransaction,
   checkDatabaseHealth,
@@ -15,7 +16,8 @@ import {
 } from "../apps/web/app/lib/db.ts";
 import {
   assertNoPersistentAdminPasswordInProd,
-  consumeRateLimitBucket
+  consumeRateLimitBucket,
+  resetRateLimitsForTests
 } from "../apps/web/app/lib/auth.ts";
 import { POST as bootstrapPost } from "../apps/web/app/api/auth/bootstrap/route.ts";
 import { POST as loginPost } from "../apps/web/app/api/auth/login/route.ts";
@@ -67,6 +69,7 @@ async function main() {
   delete process.env.ESTATEPILOT_DEV_SERVER;
   process.env.ALLOW_DEV_PGLITE = "true";
   process.env.ALLOW_SCHEMA_MIGRATION = "false";
+  setDatabaseFaultInjectionForTests("none");
 
   // 1. Database Isolation, Provisioning SQL, Role Separation, TLS & PII Redaction Tests
   await runStep("1.1 Provisioning SQL (000_provision_isolated_database_and_roles.sql) is complete and enforces least privilege", async () => {
@@ -162,17 +165,18 @@ async function main() {
     }
   });
 
-  await runStep("1.5 PII redaction masks phone numbers, emails, DB URLs, and session/bootstrap tokens", async () => {
+  await runStep("1.5 PII redaction masks phone numbers, emails, RDS endpoints, DB URLs, and session/bootstrap tokens", async () => {
     const raw =
-      "Failed for user@estatepilot.in phone +91 98450 77889 url postgresql://estatepilot_app:MySecret@rds:5432/estatepilot_ai ep_session=abc123def";
+      "Failed for user@estatepilot.in phone +91 98450 77889 host aurelia-timeflow-db-mumbai.abc.ap-south-1.rds.amazonaws.com:5432 url postgresql://estatepilot_app:MySecret@rds:5432/estatepilot_ai ep_session=abc123def";
     const redacted = redactPII(raw);
     assert.ok(!redacted.includes("user@estatepilot.in"));
     assert.ok(!redacted.includes("98450"));
     assert.ok(!redacted.includes("MySecret"));
+    assert.ok(!redacted.includes("aurelia-timeflow-db-mumbai"));
     assert.ok(!redacted.includes("abc123def"));
   });
 
-  // 2. Production PGlite Block, Runtime Migration Prohibition & Checksum Verification Tests
+  // 2. Production PGlite Block, Runtime Migration Prohibition, Checksum Verification & Append-Only Audit Log Tests
   await runStep("2.1 PGlite is strictly blocked when NODE_ENV=production or ALLOW_DEV_PGLITE=false", async () => {
     const origNodeEnv = process.env.NODE_ENV;
     const origAllowPglite = process.env.ALLOW_DEV_PGLITE;
@@ -225,7 +229,7 @@ async function main() {
     assert.equal(verified.checksum, validChecksum);
   });
 
-  await runStep("2.4 Verify PostgreSQL transaction rollback on error", async () => {
+  await runStep("2.4 Verify PostgreSQL transaction rollback on error and append-only immutability on audit_events", async () => {
     const before = await dbQuery<{ count: string }>(`SELECT COUNT(*)::text AS count FROM estatepilot.audit_events`);
     await assert.rejects(async () => {
       await withTransaction(async (tx) => {
@@ -239,6 +243,20 @@ async function main() {
 
     const after = await dbQuery<{ count: string }>(`SELECT COUNT(*)::text AS count FROM estatepilot.audit_events`);
     assert.equal(after.rows[0].count, before.rows[0].count);
+
+    // Insert an audit event and verify UPDATE and DELETE are blocked by database trigger
+    await dbQuery(
+      `INSERT INTO estatepilot.audit_events (entity_type, entity_id, action, actor_id, actor_role, details)
+       VALUES ('AUTH', 'immutable_test_1', 'TEST_IMMUTABLE', 'system', 'SYSTEM', '{}'::jsonb)`
+    );
+    await assert.rejects(
+      () => dbQuery(`UPDATE estatepilot.audit_events SET action = 'TAMPERED' WHERE entity_id = 'immutable_test_1'`),
+      /AUDIT_LOG_IMMUTABLE/
+    );
+    await assert.rejects(
+      () => dbQuery(`DELETE FROM estatepilot.audit_events WHERE entity_id = 'immutable_test_1'`),
+      /AUDIT_LOG_IMMUTABLE/
+    );
   });
 
   // 3. Unauthenticated Access Protection Tests
@@ -281,7 +299,7 @@ async function main() {
     assert.equal(exportRes.status, 401);
   });
 
-  // 4. Fail-Closed Bootstrap Token, Concurrency-Safe First-Admin Provisioning & Session Expiry
+  // 4. Fail-Closed Bootstrap Token, Concurrency-Safe First-Admin Provisioning, Session Expiry & Rate Limiting
   let superAdminCookie = "";
   let superAdminCsrf = "";
   const TEST_BOOTSTRAP_SECRET = "ep_bootstrap_secret_token_2026_mumbai";
@@ -439,7 +457,7 @@ async function main() {
     assert.ok(seedData.leadsSeeded >= 5);
   });
 
-  await runStep("4.6 Distributed PostgreSQL rate limiter enforces limits across login, enquiry, AI chat, and WebRTC endpoints", async () => {
+  await runStep("4.6 Distributed PostgreSQL rate limiter returns HTTP 429 with Retry-After when limit is exceeded across endpoints", async () => {
     const key = "test:bucket:ip-192.0.2.99";
     const r1 = await consumeRateLimitBucket(key, 2, 60_000);
     const r2 = await consumeRateLimitBucket(key, 2, 60_000);
@@ -449,16 +467,103 @@ async function main() {
     assert.equal(r3.allowed, false);
     assert.ok(r3.retryAfterSeconds > 0);
 
-    // Verify WebRTC room endpoint sanitizes untrusted Host headers and creates room
-    const roomRes = await webrtcRoomsPost(
+    // Exhaust WebRTC room creation rate limit (15 requests per 10m) for IP 10.99.99.1 and verify 16th returns HTTP 429
+    for (let i = 0; i < 15; i++) {
+      const okRes = await webrtcRoomsPost(
+        new Request("http://localhost:3000/api/webrtc/rooms", {
+          method: "POST",
+          headers: { host: "evil.example.com/injected", "x-forwarded-for": "10.99.99.1" }
+        })
+      );
+      assert.equal(okRes.status, 201);
+      if (i === 0) {
+        const roomData = await okRes.json();
+        assert.ok(roomData.customerUrl.startsWith("http://localhost:3000/call/"));
+      }
+    }
+    const webrtc429 = await webrtcRoomsPost(
       new Request("http://localhost:3000/api/webrtc/rooms", {
         method: "POST",
-        headers: { host: "evil.example.com/injected", "x-forwarded-for": "10.90.0.1" }
+        headers: { "x-forwarded-for": "10.99.99.1" }
       })
     );
-    assert.equal(roomRes.status, 201);
-    const roomData = await roomRes.json();
-    assert.ok(roomData.customerUrl.startsWith("http://localhost:3000/call/"));
+    assert.equal(webrtc429.status, 429);
+    assert.ok(Number(webrtc429.headers.get("retry-after") || 0) > 0);
+    const webrtc429Body = await webrtc429.json();
+    assert.equal(webrtc429Body.code, "RATE_LIMITED");
+
+    // Exhaust AI chat rate limit (30 requests per 5m) for IP 10.99.99.2 and verify 31st returns HTTP 429
+    await dbQuery(
+      `INSERT INTO estatepilot.rate_limit_buckets (bucket_key, request_count, window_started_at, expires_at)
+       VALUES ('aichat_ip:10.99.99.2', 30, NOW(), NOW() + INTERVAL '5 minutes')`
+    );
+    const chat429 = await aiChatPost(
+      new Request("http://localhost:3000/api/ai/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-forwarded-for": "10.99.99.2" },
+        body: JSON.stringify({ message: "Show plots in Devanahalli", language: "English" })
+      })
+    );
+    assert.equal(chat429.status, 429);
+    assert.ok(Number(chat429.headers.get("retry-after") || 0) > 0);
+    const chat429Body = await chat429.json();
+    assert.equal(chat429Body.code, "RATE_LIMITED");
+  });
+
+  await runStep("4.7 Rate limiter fails closed with HTTP 503 and leaks zero database errors when PostgreSQL rate-limit store fails", async () => {
+    setDatabaseFaultInjectionForTests("rate_limit_unavailable");
+    try {
+      const chat503 = await aiChatPost(
+        new Request("http://localhost:3000/api/ai/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-forwarded-for": "10.88.0.1" },
+          body: JSON.stringify({ message: "Hello", language: "English" })
+        })
+      );
+      assert.equal(chat503.status, 503, "AI chat must fail closed with HTTP 503 when rate limiter DB fails");
+      const chatText = await chat503.text();
+      assert.ok(!chatText.includes("SimulatedSecretPass"), "Must not leak DB password");
+      assert.ok(!chatText.includes("aurelia-timeflow-db-mumbai"), "Must not leak RDS hostname");
+      assert.ok(!chatText.includes("rate_limit_buckets"), "Must not leak internal SQL table name");
+
+      const webrtc503 = await webrtcRoomsPost(
+        new Request("http://localhost:3000/api/webrtc/rooms", {
+          method: "POST",
+          headers: { "x-forwarded-for": "10.88.0.2" }
+        })
+      );
+      assert.equal(webrtc503.status, 503, "WebRTC room creation must fail closed with HTTP 503 when rate limiter DB fails");
+      const webrtcText = await webrtc503.text();
+      assert.ok(!webrtcText.includes("SimulatedSecretPass"));
+      assert.ok(!webrtcText.includes("aurelia-timeflow-db-mumbai"));
+
+      const leads503 = await leadsPost(
+        new Request("http://localhost:3000/api/leads", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-forwarded-for": "10.88.0.3" },
+          body: JSON.stringify({
+            fullName: "Test Customer",
+            phone: "+91 98450 11223",
+            propertyType: "PLOT",
+            preferredLocation: "Devanahalli",
+            consentGranted: true
+          })
+        })
+      );
+      assert.equal(leads503.status, 503, "Enquiry submission must fail closed with HTTP 503 when rate limiter DB fails");
+
+      const login503 = await loginPost(
+        new Request("http://localhost:3000/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-forwarded-for": "10.88.0.4" },
+          body: JSON.stringify({ email: "superadmin@estatepilot.in", password: "SuperSecurePassword2026!" })
+        })
+      );
+      assert.equal(login503.status, 503, "Login must fail closed with HTTP 503 when rate limiter DB fails");
+    } finally {
+      setDatabaseFaultInjectionForTests("none");
+      await resetRateLimitsForTests();
+    }
   });
 
   // 5. Public Enquiry Submission, Validation, Duplicate & Compliance Tests
@@ -696,7 +801,7 @@ async function main() {
     assert.equal(spoofPatchRes.status, 403);
   });
 
-  await runStep("6.3 Legitimate EXECUTIVE ('Suresh Kumar') sees only their assigned leads and can update status, including DO_NOT_CONTACT", async () => {
+  await runStep("6.3 Legitimate EXECUTIVE ('Suresh Kumar') sees only their assigned leads, cannot reassign leads, cannot export CSV reports (403), and can update status", async () => {
     const execLeadsRes = await leadsGet(
       new Request("http://localhost:3000/api/leads", {
         method: "GET",
@@ -709,6 +814,32 @@ async function main() {
     for (const lead of execLeadsData.leads) {
       assert.equal(lead.assignedExecutive, "Suresh Kumar (Kannada Language Specialist)");
     }
+
+    // Executive cannot reassign lead to another specialist
+    const reassignRes = await leadsPatch(
+      new Request("http://localhost:3000/api/leads", {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          cookie: executiveCookie,
+          "x-csrf-token": executiveCsrf
+        },
+        body: JSON.stringify({
+          leadId: createdLeadId,
+          assignedExecutive: "Rajesh Sharma (Senior Property Specialist)"
+        })
+      })
+    );
+    assert.equal(reassignRes.status, 403);
+
+    // Executive cannot export CSV reports
+    const execExportRes = await reportsExportGet(
+      new Request("http://localhost:3000/api/reports/export?type=daily-enquiries", {
+        method: "GET",
+        headers: { cookie: executiveCookie }
+      })
+    );
+    assert.equal(execExportRes.status, 403);
 
     const dncPatchRes = await leadsPatch(
       new Request("http://localhost:3000/api/leads", {
@@ -730,7 +861,7 @@ async function main() {
     assert.equal(dncData.lead.consent.granted, false);
   });
 
-  await runStep("6.4 EXECUTIVE, MANAGER, and ADMIN cannot create staff accounts (/api/auth/users is SUPER_ADMIN only)", async () => {
+  await runStep("6.4 EXECUTIVE, MANAGER, and ADMIN cannot create staff accounts or run baseline seed (/api/auth/users & /api/admin/seed are SUPER_ADMIN only)", async () => {
     for (const [cookie, csrf] of [
       [executiveCookie, executiveCsrf],
       [managerCookie, managerCsrf],
@@ -762,13 +893,42 @@ async function main() {
         })
       );
       assert.equal(createRes.status, 403);
+
+      const seedAttempt = await seedPost(
+        new Request("http://localhost:3000/api/admin/seed", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            cookie,
+            "x-csrf-token": csrf
+          }
+        })
+      );
+      assert.equal(seedAttempt.status, 403);
     }
   });
 
   // 7. Property Ingestion, Verification RBAC, Unverified Exclusion & CSV Formula Sanitization
   let unverifiedPropId = "";
 
-  await runStep("7.1 MANAGER can upload new brochure (isVerified=false) but cannot approve verification (403)", async () => {
+  await runStep("7.1 MANAGER can upload new brochure (isVerified=false), EXECUTIVE cannot upload (403), and MANAGER cannot approve verification (403)", async () => {
+    const execUploadAttempt = await propsPost(
+      new Request("http://localhost:3000/api/properties", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          cookie: executiveCookie,
+          "x-csrf-token": executiveCsrf
+        },
+        body: JSON.stringify({
+          name: "Executive Unauthorized Upload",
+          category: "PLOT",
+          approvedRatePerSqFt: 4500
+        })
+      })
+    );
+    assert.equal(execUploadAttempt.status, 403);
+
     const uploadRes = await propsPost(
       new Request("http://localhost:3000/api/properties", {
         method: "POST",
@@ -794,6 +954,19 @@ async function main() {
     const uploadData = await uploadRes.json();
     assert.equal(uploadData.property.isVerified, false);
     unverifiedPropId = uploadData.property.id;
+
+    // Missing CSRF token on mutating POST/PATCH is rejected with 403 CSRF_INVALID
+    const missingCsrfPatch = await propsPatch(
+      new Request("http://localhost:3000/api/properties", {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          cookie: adminCookie
+        },
+        body: JSON.stringify({ id: unverifiedPropId, isVerified: true })
+      })
+    );
+    assert.equal(missingCsrfPatch.status, 403);
 
     const verifyAttempt = await propsPatch(
       new Request("http://localhost:3000/api/properties", {
@@ -826,6 +999,16 @@ async function main() {
     );
     const execPropsData = await execPropsRes.json();
     assert.ok(execPropsData.properties.every((p: { isVerified: boolean }) => p.isVerified === true));
+
+    // ADMIN and MANAGER can inspect unverified inventory when reviewing brochures
+    const mgrPropsRes = await propsGet(
+      new Request("http://localhost:3000/api/properties?verifiedOnly=false", {
+        method: "GET",
+        headers: { cookie: managerCookie }
+      })
+    );
+    const mgrPropsData = await mgrPropsRes.json();
+    assert.ok(mgrPropsData.properties.some((p: { id: string }) => p.id === unverifiedPropId));
 
     const aiRes = await aiChatPost(
       new Request("http://localhost:3000/api/ai/chat", {
@@ -873,17 +1056,74 @@ async function main() {
     assert.ok(csvText.includes("\"'=CMD|' /C calc'!A0\""), "Formula payload must be neutralized with leading single quote");
   });
 
-  // 8. Health Endpoint Verification
-  await runStep("8.1 Health endpoint (/api/health) reports healthy PostgreSQL engine and schema version without exposing internal hostnames", async () => {
-    const res = await healthGet();
+  // 8. Health & Readiness Endpoint Verification (Healthy & Database Outage Simulation)
+  await runStep("8.1 Health endpoint (/api/health) verifies liveness, PostgreSQL connectivity, schema migration, and auth readiness without exposing internal hostnames", async () => {
+    const res = await healthGet(new Request("http://localhost:3000/api/health", { method: "GET" }));
     assert.equal(res.status, 200);
     const data = await res.json();
     assert.equal(data.status, "ok");
+    assert.equal(data.live, true);
+    assert.equal(data.ready, true);
+    assert.equal(data.checks.liveness.status, "ok");
+    assert.equal(data.checks.database.status, "ok");
+    assert.equal(data.checks.migrations.status, "ok");
+    assert.equal(data.checks.migrations.checksumValid, true);
+    assert.equal(data.checks.auth.status, "ok");
+    assert.equal(data.checks.auth.provisioned, true);
+    assert.equal(data.checks.auth.rateLimiterReady, true);
     assert.equal(data.database.connected, true);
     assert.equal(data.database.migrationVersion, "001_estatepilot_schema.sql");
     assert.ok(data.database.counts.leads >= 6);
     assert.ok(data.database.counts.properties >= 5);
     assert.ok(data.database.counts.adminUsers >= 5);
+  });
+
+  await runStep("8.2 Database outage causes /api/health readiness to return HTTP 503 (ready=false) and API routes to fail closed with zero credential/hostname leakage", async () => {
+    setDatabaseFaultInjectionForTests("db_unavailable");
+    try {
+      // Liveness probe still reports process alive (200)
+      const liveRes = await healthGet(
+        new Request("http://localhost:3000/api/health?probe=liveness", { method: "GET" })
+      );
+      assert.equal(liveRes.status, 200);
+      const liveData = await liveRes.json();
+      assert.equal(liveData.live, true);
+
+      // Default readiness check must return HTTP 503 and ready=false without leaking DB URL/hostname/SQL errors
+      const readyRes = await healthGet(
+        new Request("http://localhost:3000/api/health", { method: "GET" })
+      );
+      assert.equal(readyRes.status, 503);
+      const readyText = await readyRes.text();
+      assert.ok(!readyText.includes("SimulatedSecretPass"), "Health response must never leak credentials");
+      assert.ok(!readyText.includes("aurelia-timeflow-db-mumbai"), "Health response must never leak RDS endpoint");
+      assert.ok(!readyText.includes("estatepilot_app"), "Health response must never leak DB username");
+      const readyData = JSON.parse(readyText);
+      assert.equal(readyData.status, "degraded");
+      assert.equal(readyData.ready, false);
+      assert.equal(readyData.checks.liveness.status, "ok");
+      assert.equal(readyData.checks.database.status, "unavailable");
+
+      // Protected and public API routes fail closed with 503 and zero leakage during DB outage
+      const leadsOutageRes = await leadsGet(
+        new Request("http://localhost:3000/api/leads", {
+          method: "GET",
+          headers: { cookie: superAdminCookie }
+        })
+      );
+      assert.equal(leadsOutageRes.status, 503);
+      const leadsOutageText = await leadsOutageRes.text();
+      assert.ok(!leadsOutageText.includes("SimulatedSecretPass"));
+
+      const propsOutageRes = await propsGet(
+        new Request("http://localhost:3000/api/properties", { method: "GET" })
+      );
+      assert.equal(propsOutageRes.status, 503);
+      const propsOutageText = await propsOutageRes.text();
+      assert.ok(!propsOutageText.includes("SimulatedSecretPass"));
+    } finally {
+      setDatabaseFaultInjectionForTests("none");
+    }
   });
 
   const healthSummary = await checkDatabaseHealth();

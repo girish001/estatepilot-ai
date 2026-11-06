@@ -194,6 +194,21 @@ CREATE INDEX IF NOT EXISTS estatepilot_audit_entity_idx
 CREATE INDEX IF NOT EXISTS estatepilot_audit_occurred_idx
   ON estatepilot.audit_events (occurred_at DESC);
 
+CREATE OR REPLACE FUNCTION estatepilot.prevent_audit_events_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'AUDIT_LOG_IMMUTABLE: estatepilot.audit_events is strictly append-only; % is prohibited.', TG_OP;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS estatepilot_audit_events_immutable_trg ON estatepilot.audit_events;
+CREATE TRIGGER estatepilot_audit_events_immutable_trg
+  BEFORE UPDATE OR DELETE ON estatepilot.audit_events
+  FOR EACH ROW
+  EXECUTE FUNCTION estatepilot.prevent_audit_events_mutation();
+
 -- 10. Grant least-privilege runtime permissions if estatepilot_app role exists
 REVOKE ALL ON ALL TABLES IN SCHEMA estatepilot FROM PUBLIC;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA estatepilot FROM PUBLIC;

@@ -45,8 +45,11 @@ const FORBIDDEN_MASTER_USERS = new Set([
 
 export const EXPECTED_MIGRATION_VERSION = "001_estatepilot_schema.sql";
 
+export type FaultInjectionMode = "none" | "db_unavailable" | "rate_limit_unavailable";
+
 let pgPool: Pool | null = null;
 let pgliteInstance: EmbeddedPgLike | null = null;
+let testFaultInjectionMode: FaultInjectionMode = "none";
 let verifiedSchemaCache: {
   mode: "rds-postgres" | "dev-pglite";
   migrationVersion: string;
@@ -54,14 +57,70 @@ let verifiedSchemaCache: {
 } | null = null;
 
 /**
- * Redacts phone numbers, emails, database credentials, and secrets from log messages to prevent PII leakage.
+ * Test-only hook to simulate PostgreSQL or rate-limiter database outages during automated verification.
+ * Strictly ignored when NODE_ENV === "production".
+ */
+export function setDatabaseFaultInjectionForTests(mode: FaultInjectionMode): void {
+  if (process.env.NODE_ENV === "production") {
+    testFaultInjectionMode = "none";
+    return;
+  }
+  testFaultInjectionMode = mode;
+}
+
+function checkTestFaultInjection(sql?: string): void {
+  if (process.env.NODE_ENV === "production" || testFaultInjectionMode === "none") {
+    return;
+  }
+  if (testFaultInjectionMode === "db_unavailable") {
+    throw new Error(
+      "DATABASE_UNAVAILABLE: Connection terminated unexpectedly to postgresql://estatepilot_app:SimulatedSecretPass@aurelia-timeflow-db-mumbai.ap-south-1.rds.amazonaws.com:5432/estatepilot_ai"
+    );
+  }
+  if (
+    testFaultInjectionMode === "rate_limit_unavailable" &&
+    sql &&
+    /rate_limit_buckets/i.test(sql)
+  ) {
+    throw new Error(
+      "RATE_LIMIT_STORE_UNAVAILABLE: relation estatepilot.rate_limit_buckets unreachable on postgresql://estatepilot_app:SimulatedSecretPass@aurelia-timeflow-db-mumbai.ap-south-1.rds.amazonaws.com:5432/estatepilot_ai"
+    );
+  }
+}
+
+/**
+ * Classifies whether an error represents an underlying database or schema availability failure.
+ */
+export function isDatabaseUnavailableError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error ?? "");
+  return (
+    msg.includes("DATABASE_UNAVAILABLE") ||
+    msg.includes("RATE_LIMIT_STORE_UNAVAILABLE") ||
+    msg.includes("PRODUCTION_DB_REQUIRED") ||
+    msg.includes("SCHEMA_NOT_MIGRATED") ||
+    msg.includes("SCHEMA_CHECKSUM_MISMATCH") ||
+    msg.includes("MIGRATION_FORBIDDEN_AT_RUNTIME") ||
+    msg.includes("CRITICAL SAFETY BLOCK") ||
+    msg.includes("ECONNREFUSED") ||
+    msg.includes("ETIMEDOUT") ||
+    msg.includes("Connection terminated") ||
+    msg.includes("connection timeout")
+  );
+}
+
+/**
+ * Redacts phone numbers, emails, database credentials, hostnames, and secrets from log messages to prevent PII leakage.
  */
 export function redactPII(input: string): string {
   return input
     .replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "postgresql://[REDACTED_DB_URL]")
+    .replace(/[a-z0-9.-]+\.rds\.amazonaws\.com(:\d+)?/gi, "[REDACTED_RDS_ENDPOINT]")
     .replace(/(\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}/g, "+91******REDACTED")
     .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, "[EMAIL_REDACTED]")
-    .replace(/(password|secret|token|ep_session|x-csrf-token|x-bootstrap-token)=([^\s&;]+)/gi, "$1=[REDACTED]");
+    .replace(
+      /(password|secret|token|ep_session|ep_csrf|x-csrf-token|x-bootstrap-token|bootstrapToken)=([^\s&;]+)/gi,
+      "$1=[REDACTED]"
+    );
 }
 
 function resolveMigrationPath(): string {
@@ -166,7 +225,9 @@ export function assertSafeDatabaseUrl(
 /**
  * Resolves PostgreSQL TLS configuration and prevents disabling certificate verification in production.
  */
-export function resolveDatabaseSslConfig(hostname: string): false | { rejectUnauthorized: boolean; ca?: string } {
+export function resolveDatabaseSslConfig(
+  hostname: string
+): false | { rejectUnauthorized: boolean; ca?: string } {
   const isProd = process.env.NODE_ENV === "production";
   const rejectUnauthEnv = process.env.DATABASE_SSL_REJECT_UNAUTHORIZED;
 
@@ -371,6 +432,8 @@ export async function verifySchemaReady(): Promise<{
   migrationVersion: string;
   checksum: string;
 }> {
+  checkTestFaultInjection();
+
   if (verifiedSchemaCache) {
     return verifiedSchemaCache;
   }
@@ -448,6 +511,7 @@ export async function dbQuery<T = QueryResultRow>(
   sql: string,
   params: unknown[] = []
 ): Promise<DbQueryResult<T>> {
+  checkTestFaultInjection(sql);
   await verifySchemaReady();
 
   if (isUsingExternalPostgres()) {
@@ -471,6 +535,7 @@ export async function dbQuery<T = QueryResultRow>(
  * Executes a callback inside an atomic PostgreSQL transaction (BEGIN ... COMMIT / ROLLBACK).
  */
 export async function withTransaction<R>(fn: (client: DbClient) => Promise<R>): Promise<R> {
+  checkTestFaultInjection();
   await verifySchemaReady();
 
   if (isUsingExternalPostgres()) {
@@ -480,6 +545,7 @@ export async function withTransaction<R>(fn: (client: DbClient) => Promise<R>): 
       await client.query("BEGIN");
       const wrappedClient: DbClient = {
         async query<T = QueryResultRow>(sql: string, params: unknown[] = []) {
+          checkTestFaultInjection(sql);
           const res = await client.query(sql, params);
           return {
             rows: res.rows as T[],
@@ -502,6 +568,7 @@ export async function withTransaction<R>(fn: (client: DbClient) => Promise<R>): 
   return pg.transaction(async (tx) => {
     const wrappedClient: DbClient = {
       async query<T = QueryResultRow>(sql: string, params: unknown[] = []) {
+        checkTestFaultInjection(sql);
         const res = await tx.query<T>(sql, params);
         return {
           rows: res.rows,
@@ -552,6 +619,7 @@ export async function recordAuditEvent(
  */
 export async function checkDatabaseHealth() {
   const startedAt = Date.now();
+  checkTestFaultInjection();
   const mig = await verifySchemaReady();
   const counts = await dbQuery<{
     properties: number;

@@ -51,6 +51,8 @@ export function constantTimeStringEqual(a: string, b: string): boolean {
 /**
  * Distributed PostgreSQL-backed sliding/fixed-window rate limiter stored in estatepilot.rate_limit_buckets.
  * Replaces process-local in-memory Maps so rate limits hold across serverless/container instances.
+ * Strictly fails closed: if the database or rate_limit_buckets table is unavailable, throws an error
+ * so callers return HTTP 503 instead of bypassing rate limits.
  */
 export async function consumeRateLimitBucket(
   bucketKey: string,
@@ -58,12 +60,6 @@ export async function consumeRateLimitBucket(
   windowMs: number
 ): Promise<{ allowed: boolean; retryAfterSeconds: number; requestCount: number }> {
   const safeWindowSeconds = Math.max(1, Math.ceil(windowMs / 1000));
-
-  // Opportunistically prune expired rate-limit rows (non-blocking)
-  await dbQuery(
-    `DELETE FROM estatepilot.rate_limit_buckets WHERE expires_at <= NOW() AND bucket_key <> $1`,
-    [bucketKey]
-  ).catch(() => {});
 
   const res = await dbQuery<{ request_count: number; retry_after_seconds: number }>(
     `INSERT INTO estatepilot.rate_limit_buckets (
@@ -91,6 +87,12 @@ export async function consumeRateLimitBucket(
     [bucketKey, String(safeWindowSeconds)]
   );
 
+  // Opportunistically prune expired rate-limit rows after primary bucket update succeeds
+  await dbQuery(
+    `DELETE FROM estatepilot.rate_limit_buckets WHERE expires_at <= NOW() AND bucket_key <> $1`,
+    [bucketKey]
+  ).catch(() => {});
+
   const row = res.rows[0];
   const count = Number(row?.request_count ?? 1);
   const retryAfterSeconds = Number(row?.retry_after_seconds ?? safeWindowSeconds);
@@ -100,6 +102,20 @@ export async function consumeRateLimitBucket(
     retryAfterSeconds: count <= maxRequests ? 0 : retryAfterSeconds,
     requestCount: count
   };
+}
+
+export function buildRateLimitUnavailableResponse(): NextResponse {
+  return NextResponse.json(
+    {
+      success: false,
+      code: "SERVICE_UNAVAILABLE",
+      message: "Service temporarily unavailable. Please try again shortly."
+    },
+    {
+      status: 503,
+      headers: { "Cache-Control": "no-store" }
+    }
+  );
 }
 
 export async function checkLoginRateLimit(ip: string): Promise<{
@@ -667,7 +683,16 @@ export async function requireRole(
   | { authorized: true; session: AuthenticatedSession }
   | { authorized: false; response: NextResponse }
 > {
-  const session = await getSessionFromRequest(request);
+  let session: AuthenticatedSession | null = null;
+  try {
+    session = await getSessionFromRequest(request);
+  } catch {
+    return {
+      authorized: false,
+      response: buildRateLimitUnavailableResponse()
+    };
+  }
+
   if (!session) {
     return {
       authorized: false,
@@ -690,7 +715,7 @@ export async function requireRole(
       actorId: session.user.id,
       actorRole: session.user.role,
       details: { requiredRoles: allowedRoles, method: request.method }
-    });
+    }).catch(() => {});
 
     return {
       authorized: false,

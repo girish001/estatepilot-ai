@@ -5,14 +5,17 @@ applications:
       phases:
         preBuild:
           commands:
+            - nvm use 20 || (nvm install 20 && nvm use 20) || true
             - node -v
             - npm -v
-            - rm -rf node_modules ../../node_modules
+            - (cd ../.. && npm ci --include=dev --no-audit --no-fund)
             - npm ci --workspaces=false --include=dev --no-audit --no-fund
         build:
           commands:
             - npm run typecheck
+            - npm run lint
             - npm run build
+            - test -f .next/required-server-files.json
       artifacts:
         baseDirectory: .next
         files:

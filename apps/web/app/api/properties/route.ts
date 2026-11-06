@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
-import { getSessionFromRequest, requireRole } from "../../lib/auth";
-import { redactPII } from "../../lib/db";
+import {
+  buildRateLimitUnavailableResponse,
+  getSessionFromRequest,
+  requireRole
+} from "../../lib/auth";
+import { isDatabaseUnavailableError, redactPII } from "../../lib/db";
 import {
   createPropertyInDb,
   listPropertiesFromDb,
@@ -36,16 +40,22 @@ export async function GET(request: Request) {
       pageSize
     });
 
-    return NextResponse.json({
-      success: true,
-      ...result
-    });
+    return NextResponse.json(
+      {
+        success: true,
+        ...result
+      },
+      { headers: { "Cache-Control": "no-store" } }
+    );
   } catch (error) {
     const msg = error instanceof Error ? error.message : "Internal error";
     console.error("[GET /api/properties Error]:", redactPII(msg));
+    if (isDatabaseUnavailableError(error)) {
+      return buildRateLimitUnavailableResponse();
+    }
     return NextResponse.json(
       { success: false, message: "Unable to query property inventory." },
-      { status: 500 }
+      { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 }
@@ -84,7 +94,7 @@ export async function POST(request: Request) {
           success: false,
           message: "Project name, property category, and approved rate per sq.ft. are required."
         },
-        { status: 400 }
+        { status: 400, headers: { "Cache-Control": "no-store" } }
       );
     }
 
@@ -107,12 +117,30 @@ export async function POST(request: Request) {
       actor: auth.session.user
     });
 
-    return NextResponse.json({ success: true, property: newProperty }, { status: 201 });
+    return NextResponse.json(
+      { success: true, property: newProperty },
+      { status: 201, headers: { "Cache-Control": "no-store" } }
+    );
   } catch (error) {
     const msg = error instanceof Error ? error.message : "Internal error";
+    if (isDatabaseUnavailableError(error)) {
+      console.error("[POST /api/properties Error]:", redactPII(msg));
+      return buildRateLimitUnavailableResponse();
+    }
+    if (
+      msg.includes("required") ||
+      msg.includes("Invalid property category") ||
+      msg.includes("positive number")
+    ) {
+      return NextResponse.json(
+        { success: false, message: msg },
+        { status: 400, headers: { "Cache-Control": "no-store" } }
+      );
+    }
+    console.error("[POST /api/properties Error]:", redactPII(msg));
     return NextResponse.json(
-      { success: false, message: msg },
-      { status: 400 }
+      { success: false, message: "Unable to create property record." },
+      { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 }
@@ -128,7 +156,7 @@ export async function PATCH(request: Request) {
     if (!id || typeof id !== "string") {
       return NextResponse.json(
         { success: false, message: "Property id is required." },
-        { status: 400 }
+        { status: 400, headers: { "Cache-Control": "no-store" } }
       );
     }
 
@@ -142,24 +170,37 @@ export async function PATCH(request: Request) {
       actor: auth.session.user
     });
 
-    return NextResponse.json({ success: true, property: updated });
+    return NextResponse.json(
+      { success: true, property: updated },
+      { headers: { "Cache-Control": "no-store" } }
+    );
   } catch (error) {
     const msg = error instanceof Error ? error.message : "Internal error";
     if (msg.startsWith("NOT_FOUND:")) {
       return NextResponse.json(
         { success: false, message: msg.replace(/^NOT_FOUND:\s*/, "") },
-        { status: 404 }
+        { status: 404, headers: { "Cache-Control": "no-store" } }
       );
     }
     if (msg.startsWith("FORBIDDEN:")) {
       return NextResponse.json(
         { success: false, message: msg.replace(/^FORBIDDEN:\s*/, "") },
-        { status: 403 }
+        { status: 403, headers: { "Cache-Control": "no-store" } }
       );
     }
+    if (msg.includes("positive number")) {
+      return NextResponse.json(
+        { success: false, message: msg },
+        { status: 400, headers: { "Cache-Control": "no-store" } }
+      );
+    }
+    console.error("[PATCH /api/properties Error]:", redactPII(msg));
+    if (isDatabaseUnavailableError(error)) {
+      return buildRateLimitUnavailableResponse();
+    }
     return NextResponse.json(
-      { success: false, message: msg },
-      { status: 400 }
+      { success: false, message: "Unable to update property record." },
+      { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 }

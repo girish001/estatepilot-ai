@@ -2,9 +2,11 @@ import { NextResponse } from "next/server";
 import {
   authenticateAdmin,
   bootstrapFirstSuperAdmin,
+  buildRateLimitUnavailableResponse,
   buildSessionCookieHeader,
   getClientIp
 } from "../../../lib/auth";
+import { isDatabaseUnavailableError, redactPII } from "../../../lib/db";
 import { seedReviewedBaselineData } from "../../../lib/repositories";
 
 export const dynamic = "force-dynamic";
@@ -91,10 +93,18 @@ export async function POST(request: Request) {
       );
     }
 
+    if (isDatabaseUnavailableError(error)) {
+      console.error("[POST /api/auth/bootstrap DB Error]:", redactPII(msg));
+      return buildRateLimitUnavailableResponse();
+    }
+
     return NextResponse.json(
       {
         success: false,
-        message: msg
+        message:
+          msg.includes("email") || msg.includes("name") || msg.includes("Password")
+            ? msg
+            : "Unable to complete initial bootstrap."
       },
       { status: 400, headers: { "Cache-Control": "no-store" } }
     );

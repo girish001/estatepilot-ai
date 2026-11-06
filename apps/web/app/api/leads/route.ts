@@ -1,10 +1,11 @@
 import { NextResponse } from "next/server";
 import {
+  buildRateLimitUnavailableResponse,
   checkPublicEnquiryRateLimit,
   getClientIp,
   requireRole
 } from "../../lib/auth";
-import { redactPII } from "../../lib/db";
+import { isDatabaseUnavailableError, redactPII } from "../../lib/db";
 import {
   createLeadInDb,
   listLeadsFromDb,
@@ -37,23 +38,38 @@ export async function GET(request: Request) {
       actor: auth.session.user
     });
 
-    return NextResponse.json({
-      success: true,
-      ...result
-    });
+    return NextResponse.json(
+      {
+        success: true,
+        ...result
+      },
+      { headers: { "Cache-Control": "no-store" } }
+    );
   } catch (error) {
     const msg = error instanceof Error ? error.message : "Failed to load leads.";
     console.error("[GET /api/leads Error]:", redactPII(msg));
+    if (isDatabaseUnavailableError(error)) {
+      return buildRateLimitUnavailableResponse();
+    }
     return NextResponse.json(
       { success: false, message: "Unable to query leads from database." },
-      { status: 500 }
+      { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 }
 
 export async function POST(request: Request) {
   const ip = getClientIp(request);
-  const rateLimit = await checkPublicEnquiryRateLimit(ip);
+
+  let rateLimit: { allowed: boolean; retryAfterSeconds: number };
+  try {
+    rateLimit = await checkPublicEnquiryRateLimit(ip);
+  } catch (rateError) {
+    const msg = rateError instanceof Error ? rateError.message : "Rate limiter failure";
+    console.error("[POST /api/leads RateLimiter Error]:", redactPII(msg));
+    return buildRateLimitUnavailableResponse();
+  }
+
   if (!rateLimit.allowed) {
     return NextResponse.json(
       {
@@ -75,7 +91,7 @@ export async function POST(request: Request) {
   if (contentLength > 16_384) {
     return NextResponse.json(
       { success: false, message: "Request payload too large." },
-      { status: 413 }
+      { status: 413, headers: { "Cache-Control": "no-store" } }
     );
   }
 
@@ -106,26 +122,29 @@ export async function POST(request: Request) {
           callUrl: `/call/${created.roomId}`
         }
       },
-      { status: 201 }
+      { status: 201, headers: { "Cache-Control": "no-store" } }
     );
   } catch (error) {
     const msg = error instanceof Error ? error.message : "Internal server error";
     if (msg.startsWith("VALIDATION:") || msg.startsWith("COMPLIANCE_VIOLATION:")) {
       return NextResponse.json(
         { success: false, message: msg.replace(/^(VALIDATION|COMPLIANCE_VIOLATION):\s*/, "") },
-        { status: 400 }
+        { status: 400, headers: { "Cache-Control": "no-store" } }
       );
     }
     if (msg.startsWith("DUPLICATE:")) {
       return NextResponse.json(
         { success: false, message: msg.replace(/^DUPLICATE:\s*/, "") },
-        { status: 409 }
+        { status: 409, headers: { "Cache-Control": "no-store" } }
       );
     }
     console.error("[POST /api/leads Error]:", redactPII(msg));
+    if (isDatabaseUnavailableError(error)) {
+      return buildRateLimitUnavailableResponse();
+    }
     return NextResponse.json(
       { success: false, message: "Unable to process enquiry at this time." },
-      { status: 500 }
+      { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 }
@@ -145,7 +164,7 @@ export async function PATCH(request: Request) {
     if (!leadId || typeof leadId !== "string") {
       return NextResponse.json(
         { success: false, message: "leadId is required." },
-        { status: 400 }
+        { status: 400, headers: { "Cache-Control": "no-store" } }
       );
     }
 
@@ -158,31 +177,37 @@ export async function PATCH(request: Request) {
       actor: auth.session.user
     });
 
-    return NextResponse.json({ success: true, lead: updated });
+    return NextResponse.json(
+      { success: true, lead: updated },
+      { headers: { "Cache-Control": "no-store" } }
+    );
   } catch (error) {
     const msg = error instanceof Error ? error.message : "Internal server error";
     if (msg.startsWith("NOT_FOUND:")) {
       return NextResponse.json(
         { success: false, message: msg.replace(/^NOT_FOUND:\s*/, "") },
-        { status: 404 }
+        { status: 404, headers: { "Cache-Control": "no-store" } }
       );
     }
     if (msg.startsWith("FORBIDDEN:")) {
       return NextResponse.json(
         { success: false, message: msg.replace(/^FORBIDDEN:\s*/, "") },
-        { status: 403 }
+        { status: 403, headers: { "Cache-Control": "no-store" } }
       );
     }
     if (msg.startsWith("VALIDATION:")) {
       return NextResponse.json(
         { success: false, message: msg.replace(/^VALIDATION:\s*/, "") },
-        { status: 400 }
+        { status: 400, headers: { "Cache-Control": "no-store" } }
       );
     }
     console.error("[PATCH /api/leads Error]:", redactPII(msg));
+    if (isDatabaseUnavailableError(error)) {
+      return buildRateLimitUnavailableResponse();
+    }
     return NextResponse.json(
       { success: false, message: "Failed to update lead." },
-      { status: 500 }
+      { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 }

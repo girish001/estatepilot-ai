@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
-import { checkWebrtcRoomRateLimit, getClientIp } from "../../../lib/auth";
+import {
+  buildRateLimitUnavailableResponse,
+  checkWebrtcRoomRateLimit,
+  getClientIp
+} from "../../../lib/auth";
+import { redactPII } from "../../../lib/db";
 
 export const dynamic = "force-dynamic";
 
@@ -13,31 +18,42 @@ function resolveSafeOrigin(request: Request): string {
 
   const hostHeader = (request.headers.get("host") || "localhost:3000").trim();
   const safeHost = /^[a-zA-Z0-9.-]+(:\d+)?$/.test(hostHeader) ? hostHeader : "localhost:3000";
-  const protocol = safeHost.startsWith("localhost") || safeHost.startsWith("127.0.0.1") ? "http" : "https";
+  const protocol =
+    safeHost.startsWith("localhost") || safeHost.startsWith("127.0.0.1") ? "http" : "https";
   return `${protocol}://${safeHost}`;
 }
 
 export async function POST(request: Request) {
-  try {
-    const ip = getClientIp(request);
-    const rate = await checkWebrtcRoomRateLimit(ip).catch(() => ({ allowed: true, retryAfterSeconds: 0 }));
-    if (!rate.allowed) {
-      return NextResponse.json(
-        {
-          success: false,
-          code: "RATE_LIMITED",
-          message: `Too many room creation requests. Please wait ${rate.retryAfterSeconds} seconds.`
-        },
-        {
-          status: 429,
-          headers: {
-            "Retry-After": String(rate.retryAfterSeconds),
-            "Cache-Control": "no-store"
-          }
-        }
-      );
-    }
+  const ip = getClientIp(request);
 
+  // Fail closed when the PostgreSQL rate limiter is unavailable (return 503 with generic error)
+  let rate: { allowed: boolean; retryAfterSeconds: number };
+  try {
+    rate = await checkWebrtcRoomRateLimit(ip);
+  } catch (rateError) {
+    const msg = rateError instanceof Error ? rateError.message : "Rate limiter failure";
+    console.error("[POST /api/webrtc/rooms RateLimiter Error]:", redactPII(msg));
+    return buildRateLimitUnavailableResponse();
+  }
+
+  if (!rate.allowed) {
+    return NextResponse.json(
+      {
+        success: false,
+        code: "RATE_LIMITED",
+        message: `Too many room creation requests. Please wait ${rate.retryAfterSeconds} seconds.`
+      },
+      {
+        status: 429,
+        headers: {
+          "Retry-After": String(rate.retryAfterSeconds),
+          "Cache-Control": "no-store"
+        }
+      }
+    );
+  }
+
+  try {
     const roomId = randomUUID().replaceAll("-", "");
     const fullOrigin = resolveSafeOrigin(request);
 
@@ -58,9 +74,15 @@ export async function POST(request: Request) {
       { status: 201, headers: { "Cache-Control": "no-store" } }
     );
   } catch (error) {
+    const msg = error instanceof Error ? error.message : "Room creation error";
+    console.error("[POST /api/webrtc/rooms Error]:", redactPII(msg));
     return NextResponse.json(
-      { success: false, message: error instanceof Error ? error.message : "Could not create call room." },
-      { status: 500 }
+      {
+        success: false,
+        code: "INTERNAL_ERROR",
+        message: "Could not create call room."
+      },
+      { status: 500, headers: { "Cache-Control": "no-store" } }
     );
   }
 }
