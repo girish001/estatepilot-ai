@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 const metrics = [
   { label: "New enquiries", value: "—", note: "Awaiting lead integration" },
   { label: "Follow-ups due", value: "—", note: "Customer-agreed callbacks" },
@@ -14,9 +16,8 @@ export default function HomePage() {
           <h1 style={{ margin: "8px 0", fontSize: 34 }}>Real estate lead workspace</h1>
           <p style={{ color: "#667085", margin: 0 }}>Manage enquiries, verified properties, callbacks and site visits.</p>
         </div>
-        <span style={{ border: "1px solid #cbd5e1", borderRadius: 999, padding: "8px 12px", color: "#475569", fontSize: 13 }}>Foundation · MVP</span>
+        <Link href="/enquire" style={{ background: "#2457d6", color: "#fff", borderRadius: 10, padding: "12px 18px", fontWeight: 700 }}>Open enquiry form ↗</Link>
       </header>
-
       <section aria-label="Overview metrics" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))", gap: 16, marginTop: 36 }}>
         {metrics.map((metric) => (
           <article key={metric.label} style={{ background: "#fff", border: "1px solid #e6e9f0", borderRadius: 16, padding: 20 }}>
@@ -26,7 +27,6 @@ export default function HomePage() {
           </article>
         ))}
       </section>
-
       <section style={{ marginTop: 28, background: "#fff", border: "1px solid #e6e9f0", borderRadius: 16, padding: 24 }}>
         <h2 style={{ marginTop: 0 }}>Next implementation milestones</h2>
         <ol style={{ color: "#475569", lineHeight: 2 }}>
