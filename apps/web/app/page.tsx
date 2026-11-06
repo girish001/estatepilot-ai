@@ -1,8 +1,10 @@
 "use client";
 
-import { useState, useMemo } from "react";
+export const dynamic = "force-dynamic";
+
+import { useState, useMemo, useEffect } from "react";
 import Navbar from "./components/Navbar";
-import { INITIAL_LEADS, INITIAL_PROPERTIES, LeadRecord, LeadStatus, PropertyCategory, SupportedLanguage } from "./lib/store";
+import { INITIAL_LEADS, INITIAL_PROPERTIES, LeadRecord, LeadStatus } from "./lib/store";
 
 export default function DashboardPage() {
   const [leads, setLeads] = useState<LeadRecord[]>(INITIAL_LEADS);
@@ -11,6 +13,24 @@ export default function DashboardPage() {
   const [categoryFilter, setCategoryFilter] = useState<string>("ALL");
   const [languageFilter, setLanguageFilter] = useState<string>("ALL");
   const [statusFilter, setStatusFilter] = useState<string>("ALL");
+
+  useEffect(() => {
+    let active = true;
+    fetch("/api/leads")
+      .then((res) => res.json())
+      .then((data) => {
+        if (active && data?.success && Array.isArray(data.leads) && data.leads.length > 0) {
+          setLeads(data.leads);
+          setSelectedLead((prev) => data.leads.find((l: LeadRecord) => l.id === prev?.id) || data.leads[0]);
+        }
+      })
+      .catch(() => {
+        // Fallback to initial seeded state if offline
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   // Filtering
   const filteredLeads = useMemo(() => {
@@ -62,6 +82,11 @@ export default function DashboardPage() {
     const updated = { ...selectedLead, status: newStatus, updatedAt: new Date().toISOString() };
     setSelectedLead(updated);
     setLeads((prev) => prev.map((l) => (l.id === updated.id ? updated : l)));
+    fetch("/api/leads", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ leadId: updated.id, status: newStatus })
+    }).catch(() => {});
   }
 
   function handleAssignExecutive(name: string) {
@@ -69,6 +94,11 @@ export default function DashboardPage() {
     const updated = { ...selectedLead, assignedExecutive: name, updatedAt: new Date().toISOString() };
     setSelectedLead(updated);
     setLeads((prev) => prev.map((l) => (l.id === updated.id ? updated : l)));
+    fetch("/api/leads", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ leadId: updated.id, assignedExecutive: name })
+    }).catch(() => {});
   }
 
   return (

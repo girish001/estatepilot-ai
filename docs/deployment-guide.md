@@ -145,3 +145,42 @@ EstatePilot AI provides 8 built-in audit and management reports downloadable in 
 6. **AI Voice Call Summary & Transcript Report** (`/api/reports/export?type=call-summary`)
 7. **Site Visit & Walkthrough Report** (`/api/reports/export?type=site-visits`)
 8. **End-to-End Conversion Report**
+
+---
+
+## 7. AWS Amplify Hosting (`ap-south-1` Mumbai – Next.js 15 SSR)
+
+### Required Amplify Application & Branch Settings
+- **AWS Region**: `ap-south-1` (Mumbai)
+- **Amplify App ID**: `d1mw2d2fqe4y6x`
+- **Production Branch**: `main`
+- **Platform**: `WEB_COMPUTE` (Next.js - SSR)
+- **Branch Framework**: `Next.js - SSR`
+- **Monorepo Root Directory (`AMPLIFY_MONOREPO_APP_ROOT`)**: `apps/web`
+- **Build Specification**: Root `/amplify.yml` (`appRoot: apps/web`, `baseDirectory: .next`)
+
+### AWS CLI Verification & Update Commands
+```bash
+# 1. Ensure App Platform is WEB_COMPUTE and Monorepo Root is apps/web
+aws amplify update-app \
+  --app-id d1mw2d2fqe4y6x \
+  --platform WEB_COMPUTE \
+  --environment-variables AMPLIFY_MONOREPO_APP_ROOT=apps/web \
+  --region ap-south-1
+
+# 2. Ensure the main branch Framework is set to Next.js - SSR (critical for Compute routing)
+aws amplify update-branch \
+  --app-id d1mw2d2fqe4y6x \
+  --branch-name main \
+  --framework "Next.js - SSR" \
+  --stage PRODUCTION \
+  --region ap-south-1
+
+# 3. Trigger a fresh deployment on main
+aws amplify start-job \
+  --app-id d1mw2d2fqe4y6x \
+  --branch-name main \
+  --job-type RELEASE \
+  --region ap-south-1
+```
+

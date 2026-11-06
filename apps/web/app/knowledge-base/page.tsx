@@ -2,7 +2,7 @@
 
 export const dynamic = "force-dynamic";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Navbar from "../components/Navbar";
 import { INITIAL_PROPERTIES, PropertyCategory, PropertyRecord } from "../lib/store";
 
@@ -26,26 +26,50 @@ export default function KnowledgeBasePage() {
   });
   const [uploadSuccessMsg, setUploadSuccessMsg] = useState("");
 
+  useEffect(() => {
+    let active = true;
+    fetch("/api/properties")
+      .then((res) => res.json())
+      .then((data) => {
+        if (active && data?.success && Array.isArray(data.properties) && data.properties.length > 0) {
+          setProperties(data.properties);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const filteredProperties = properties.filter((p) => {
     if (selectedCategory !== "ALL" && p.category !== selectedCategory) return false;
     return true;
   });
 
   function toggleVerification(id: string) {
+    const target = properties.find((p) => p.id === id);
+    const nextState = target ? !target.isVerified : false;
+    const verifiedBy = nextState ? "Operations Director (Approved)" : "Pending Operational Review";
+
     setProperties((prev) =>
       prev.map((p) => {
         if (p.id === id) {
-          const nextState = !p.isVerified;
           return {
             ...p,
             isVerified: nextState,
-            verifiedBy: nextState ? "Operations Director (Approved)" : "Pending Operational Review",
+            verifiedBy,
             verifiedAt: nextState ? new Date().toISOString() : ""
           };
         }
         return p;
       })
     );
+
+    fetch("/api/properties", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, isVerified: nextState, verifiedBy })
+    }).catch(() => {});
   }
 
   function handleUploadSubmit(e: React.FormEvent) {
@@ -75,6 +99,11 @@ export default function KnowledgeBasePage() {
     };
 
     setProperties([newProp, ...properties]);
+    fetch("/api/properties", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(newProp)
+    }).catch(() => {});
     setShowUploadModal(false);
     setUploadSuccessMsg(`Brochure "${uploadForm.brochureFileName}" uploaded and parsed! Marked as Pending Verification.`);
     setTimeout(() => setUploadSuccessMsg(""), 5000);

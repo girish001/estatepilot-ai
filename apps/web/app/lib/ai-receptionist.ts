@@ -19,17 +19,17 @@ export function detectLanguage(text: string): SupportedLanguage {
   const lower = text.toLowerCase();
   
   // Telugu Unicode range: \u0C00-\u0C7F
-  if (/[\u0C00-\u0C7F]/.test(text) || /\b(namaskaram|andi|meeru|pladlu|illu|vila|rate|chudataniki|eppudu)\b/i.test(lower)) {
+  if (/[\u0C00-\u0C7F]/.test(text) || /\b(namaskaram|andi|meeru|pladlu|illu|chudataniki|eppudu|entha|cheppandi|chudali|taggisi)\b/i.test(lower)) {
     return "Telugu";
   }
   
   // Kannada Unicode range: \u0C80-\u0CFF
-  if (/[\u0C80-\u0CFF]/.test(text) || /\b(namaskara|hegiddira|mane|plotu|bele|jaaga|nodi|yaavaga)\b/i.test(lower)) {
+  if (/[\u0C80-\u0CFF]/.test(text) || /\b(namaskara|hegiddira|mane|plotu|bele|jaaga|nodi|yaavaga|nodona|kadime|maadi|madbedi)\b/i.test(lower)) {
     return "Kannada";
   }
   
   // Devanagari / Hindi Unicode range: \u0900-\u097F
-  if (/[\u0900-\u097F]/.test(text) || /\b(namaste|kaise|plot|flat|ghar|keemat|bhav|dekhein|shaniwar|ravivar)\b/i.test(lower)) {
+  if (/[\u0900-\u097F]/.test(text) || /\b(namaste|kaise|ghar|keemat|bhav|dekhein|shaniwar|ravivar|kya|hai|karo)\b/i.test(lower)) {
     return "Hindi";
   }
   
