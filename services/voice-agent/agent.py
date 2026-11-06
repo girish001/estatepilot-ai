@@ -7,10 +7,11 @@ from faster_whisper import WhisperModel
 API=os.getenv("ESTATEPILOT_SIGNAL_URL","ws://localhost:4000")
 ROOM=os.environ["ESTATEPILOT_ROOM_ID"]
 OLLAMA=os.getenv("OLLAMA_URL","http://localhost:11434")
-MODEL=os.getenv("OLLAMA_MODEL","llama3.2:3b")
+MODEL=os.getenv("OLLAMA_MODEL","qwen2.5:3b")
 PIPER=os.getenv("PIPER_BIN","piper")
-VOICE=os.getenv("PIPER_VOICE","voices/en_US-lessac-medium.onnx")
-SYSTEM="""You are EstatePilot, a polite AI real-estate receptionist. Disclose that you are an AI. Reply in the caller's language, Telugu or English. Ask about property type, preferred location and configuration. NEVER ask about budget, income, loans or affordability. Never invent property facts, quote unapproved total prices, negotiate or promise discounts. If asked for unavailable facts, offer human follow-up. Respect stop requests. Keep replies short and ask one question at a time."""
+LANGUAGES={"en":"English","kn":"Kannada","te":"Telugu","hi":"Hindi"}
+VOICE_ENV={"en":"PIPER_VOICE_EN","kn":"PIPER_VOICE_KN","te":"PIPER_VOICE_TE","hi":"PIPER_VOICE_HI"}
+SYSTEM="""You are EstatePilot, a polite AI real-estate receptionist. Disclose that you are an AI. Support English, Kannada, Telugu and Hindi. Detect the language the customer is using and reply in that same language. If the customer switches language, switch with them. Do not mix languages unless asked. Ask about property type, preferred location and configuration. NEVER ask about budget, income, loans or affordability. Never invent property facts, quote unapproved total prices, negotiate or promise discounts. If asked for unavailable facts, offer human follow-up. Respect stop requests. Keep replies short and ask one question at a time."""
 
 class Speaker(MediaStreamTrack):
  kind="audio"
@@ -24,10 +25,18 @@ class Speaker(MediaStreamTrack):
   if rate!=24000: a=np.interp(np.linspace(0,len(a)-1,int(len(a)*24000/rate)),np.arange(len(a)),a).astype(np.int16)
   for i in range(0,len(a),960): await self.q.put(a[i:i+960])
 
-def llm(history):
- r=requests.post(OLLAMA+"/api/chat",json={"model":MODEL,"messages":[{"role":"system","content":SYSTEM},*history],"stream":False},timeout=90); r.raise_for_status(); return r.json()["message"]["content"].strip()
-def tts(text,path):
- with open(path,"wb") as out: subprocess.run([PIPER,"--model",VOICE,"--output_file",path],input=text.encode(),stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,check=True)
+def llm(history, language):
+ lang=LANGUAGES.get(language,"English")
+ system=SYSTEM+"\\nThe detected customer language is "+lang+". Respond only in "+lang+" unless the customer changes language."
+ r=requests.post(OLLAMA+"/api/chat",json={"model":MODEL,"messages":[{"role":"system","content":system},*history],"stream":False},timeout=90)
+ r.raise_for_status()
+ return r.json()["message"]["content"].strip()
+def tts(text,path,language):
+ voice=os.getenv(VOICE_ENV.get(language,"PIPER_VOICE_EN"))
+ if not voice:
+  raise RuntimeError("No Piper voice configured for detected language: "+LANGUAGES.get(language,language)+". Configure "+VOICE_ENV.get(language,"PIPER_VOICE_EN")+".")
+ with open(path,"wb") as out:
+  subprocess.run([PIPER,"--model",voice,"--output_file",path],input=text.encode("utf-8"),stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,check=True)
 
 async def audio_loop(track,speaker,history,whisper):
  frames=[]; count=0
@@ -43,18 +52,18 @@ async def audio_loop(track,speaker,history,whisper):
   with tempfile.NamedTemporaryFile(suffix=".wav",delete=False) as t: path=t.name
   try:
    with wave.open(path,"wb") as w: w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000); w.writeframes(np.clip(chunk,-32768,32767).astype(np.int16).tobytes())
-   seg,_=await asyncio.to_thread(whisper.transcribe,path,beam_size=1,vad_filter=True); text=" ".join(s.text.strip() for s in seg).strip()
+   seg,info=await asyncio.to_thread(whisper.transcribe,path,beam_size=1,vad_filter=True); text=" ".join(s.text.strip() for s in seg).strip(); language=info.language if info.language in LANGUAGES else "en"
   finally: os.unlink(path)
   if not text: continue
   print("Customer:",text,flush=True); history.append({"role":"user","content":text})
-  answer=await asyncio.to_thread(llm,history[-12:]); history.append({"role":"assistant","content":answer}); print("AI:",answer,flush=True)
+  answer=await asyncio.to_thread(llm,history[-12:],language); history.append({"role":"assistant","content":answer}); print("AI:",answer,flush=True)
   with tempfile.NamedTemporaryFile(suffix=".wav",delete=False) as t: out=t.name
-  try: await asyncio.to_thread(tts,answer,out); await speaker.play(out)
+  try: await asyncio.to_thread(tts,answer,out,language); await speaker.play(out)
   finally: os.unlink(out)
 
 async def main():
  whisper=await asyncio.to_thread(WhisperModel,os.getenv("WHISPER_MODEL","small"),device=os.getenv("WHISPER_DEVICE","cpu"),compute_type=os.getenv("WHISPER_COMPUTE_TYPE","int8"))
- pc=RTCPeerConnection(); speaker=Speaker(); pc.addTrack(speaker); history=[{"role":"assistant","content":"Hello, I am EstatePilot's AI receptionist. Would you prefer Telugu or English?"}]
+ pc=RTCPeerConnection(); speaker=Speaker(); pc.addTrack(speaker); history=[{"role":"assistant","content":"Hello, I am EstatePilot's AI receptionist. I can speak English, Kannada, Telugu or Hindi. Which language would you prefer?"}]
  @pc.on("track")
  def on_track(track):
   if track.kind=="audio": asyncio.create_task(audio_loop(track,speaker,history,whisper))
