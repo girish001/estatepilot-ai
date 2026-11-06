@@ -1,7 +1,5 @@
 "use client";
 
-export const dynamic = "force-dynamic";
-
 import { useState, useMemo } from "react";
 import Navbar from "./components/Navbar";
 import { INITIAL_LEADS, INITIAL_PROPERTIES, LeadRecord, LeadStatus, PropertyCategory, SupportedLanguage } from "./lib/store";
